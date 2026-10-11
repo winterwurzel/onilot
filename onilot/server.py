@@ -47,6 +47,7 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from onilot import __version__
 from onilot.users import UserError, UserStore, check_name, cli as user_cli
 
 RESELLER_ID = 1
@@ -390,7 +391,7 @@ class State:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'onilot/0.2'
+    server_version = 'onilot/' + __version__
     routes = []
 
     # ---- plumbing -----------------------------------------------------------------------
@@ -1281,6 +1282,7 @@ def env_flag(name, default='0'):
 def main(argv=None):
     p = argparse.ArgumentParser(prog='onilot', description=__doc__.split('\n')[0])
     env = os.environ.get
+    p.add_argument('--version', action='version', version='onilot ' + __version__)
     p.add_argument('--public-url', default=env('ONILOT_PUBLIC_URL'),
                    help='base URL the reader was patched to (ONILOT_PUBLIC_URL)')
     p.add_argument('--library', default=env('ONILOT_LIBRARY', 'library'),
@@ -1327,8 +1329,8 @@ def main(argv=None):
               '"python -m onilot user" or /admin)', flush=True)
 
     server = Server(cfg, users)
-    print('onilot: %d users, listening on %s:%d, API prefix %r, request log %s' % (
-        len(users.names()), cfg.bind, cfg.port, cfg.prefix,
+    print('onilot %s: %d users, listening on %s:%d, API prefix %r, request log %s' % (
+        __version__, len(users.names()), cfg.bind, cfg.port, cfg.prefix,
         cfg.log_file if cfg.request_log else 'off'), flush=True)
     server.serve_forever()
 

@@ -70,6 +70,10 @@ services:
 
 The container runs as UID 1000; make the volumes writable for it.
 
+Image tags: `latest` (main branch), `1.0.0` (exact release), `1.0` (latest patch of 1.0).
+Pin `1.0` if you prefer updates you choose yourself. Images exist for amd64, arm64 and
+arm/v7.
+
 Put HTTPS in front of it (Caddy, nginx, Traefik, a Cloudflare tunnel, …) so that
 `ONILOT_PUBLIC_URL` reaches port 8095 **with the path unchanged**. The reader trusts the
 usual public CAs (Let's Encrypt, Google Trust Services, …), so no certificate tweaks are

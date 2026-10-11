@@ -803,6 +803,13 @@ class ConfigTest(unittest.TestCase):
                                        'ONILOT_LIBRARY': tmp + '/lib', **env},
                                   capture_output=True, text=True, timeout=30)
 
+    def test_version_flag(self):
+        result = subprocess.run([sys.executable, '-m', 'onilot', '--version'], cwd=str(REPO),
+                                capture_output=True, text=True, timeout=30)
+        sys.path.insert(0, str(REPO))
+        from onilot import __version__
+        self.assertEqual(result.stdout.strip(), 'onilot ' + __version__)
+
     def test_refuses_to_start_without_public_url_or_password(self):
         result = self.run_server({'ONILOT_PASSWORD': 'x'})
         self.assertNotEqual(result.returncode, 0)

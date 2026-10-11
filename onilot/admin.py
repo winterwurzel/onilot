@@ -12,6 +12,7 @@ from pathlib import Path
 
 from onilot.server import (ADMIN_SESSION_TTL, Library, parse_multipart_file, route,
                            store_upload)
+from onilot import __version__
 from onilot.users import UserError
 
 SHARED = 'shared'
@@ -344,8 +345,8 @@ def overview(h):
             '<button class="primary" data-dialog="add-user">+ Add user</button></div>'
             '<table><tr><th>User</th><th>Own books</th><th class="hide-sm">Readers</th>'
             '<th>Last activity</th></tr>%s</table></div>'
-            '<p class="muted small">Reader endpoint: <code>%s</code></p>' % (
-                stats, ''.join(rows), esc(h.server.cfg.public_base)))
+            '<p class="muted small">Reader endpoint: <code>%s</code> · onilot %s</p>' % (
+                stats, ''.join(rows), esc(h.server.cfg.public_base), esc(__version__)))
     body += ADD_USER.format(action=esc(h._admin_url('/users')), csrf=esc(h.csrf))
     page(h, 'Overview', body, active='')
 
