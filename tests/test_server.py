@@ -910,6 +910,33 @@ class DeviceFlowTest(unittest.TestCase):
         self.assertEqual([p['value']['progress'] for p in resp['patches'] if own in p['path']],
                          [0.4])
 
+    def test_inventory_format_timestamp_is_not_in_the_future(self):
+        import importlib
+        sys.path.insert(0, str(REPO))
+        server = importlib.import_module('onilot.server')
+        self.assertLessEqual(server.INVENTORY_FORMAT_CHANGED, time.time() * 1000)
+
+    def test_inventory_sends_synopsis_and_details(self):
+        token, _ = self.new_user('det', [('Detailed Book', 'Cycle', '2')])
+        path = self.lib / 'det' / 'plain.epub'
+        opf = OPF.replace('{title}', 'Plain').replace('</metadata>', (
+            '<dc:description>&lt;p&gt;A tale.&lt;/p&gt;</dc:description>'
+            '<dc:identifier opf:scheme="ISBN" xmlns:opf="http://www.idpf.org/2007/opf">'
+            '978-0-7653-1688-9</dc:identifier><dc:date>2007-08-21T04:00:00+00:00</dc:date>'
+            '<dc:title id="st">The Subtitle</dc:title>'
+            '<meta refines="#st" property="title-type">subtitle</meta></metadata>'))
+        with zipfile.ZipFile(path, 'w') as z:
+            z.writestr('META-INF/container.xml', CONTAINER)
+            z.writestr('OEBPS/content.opf', opf)
+        items = self.inventory_titles(token)
+        plain = items['Plain']
+        self.assertEqual((plain['abstract'], plain['isbnEan'], plain['issuedDate'],
+                          plain['subtitle']),
+                         ('<p>A tale.</p>', '9780765316889', '2007-08-21T00:00:00Z',
+                          'The Subtitle'))
+        self.assertEqual(items['Detailed Book']['subtitle'], 'Cycle #2')  # series fallback
+        self.assertIsNone(items['Detailed Book']['abstract'])
+
     def test_store_pages_and_finds_series(self):
         make_series_epub(self.lib / 'shared' / 'tale1.epub', 'Tale Begins', 'Long Tale', '1')
         make_series_epub(self.lib / 'shared' / 'tale2.epub', 'Tale Ends', 'Long Tale', '2')

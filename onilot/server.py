@@ -61,6 +61,9 @@ ADMIN_SESSION_TTL = 8 * 3600
 CODE_TTL = 300
 MAX_BODY = 256 * 1024 * 1024  # largest accepted request (EPUB uploads)
 COLLECTIONS = ('tags', 'comments', 'dogears')
+# Raise to "now" (epoch ms) whenever the inventory gains fields, so readers re-read every book
+# once instead of answering 304 forever for books whose files did not change.
+INVENTORY_FORMAT_CHANGED = 1791755981804
 # "Mark as finished" on the reader adds this tag (category "system") to the book.
 FINISHED_TAG = 'collection_finished_readings_name'
 COUNTRY_NAMES = {'DE': 'Deutschland', 'AT': 'Österreich', 'CH': 'Schweiz'}
@@ -138,7 +141,8 @@ class Library:
 
     def _metadata(self, path):
         meta = {'title': path.stem, 'authors': [], 'language': None, 'publisher': None,
-                'cover': None, 'series': None, 'series_index': None}
+                'cover': None, 'series': None, 'series_index': None, 'description': None,
+                'subtitle': None, 'isbn': None, 'date': None}
         try:
             with zipfile.ZipFile(path) as z:
                 container = ET.fromstring(z.read('META-INF/container.xml'))
@@ -154,9 +158,36 @@ class Library:
                                                 namespaces=self.OPF_NS)
                 meta['cover'] = self._cover_href(opf, opf_path, z)
                 meta['series'], meta['series_index'] = self._series(md)
+                meta.update(self._details(md))
         except (KeyError, ET.ParseError, zipfile.BadZipFile, AttributeError) as exc:
             print('warning: cannot read metadata of %s: %s' % (path.name, exc))
         return meta
+
+    def _details(self, md):
+        """Description, subtitle, ISBN and publication date for the reader's book details."""
+        ns = self.OPF_NS
+        description = (md.findtext('dc:description', default='', namespaces=ns) or '').strip()
+        subtitle = None
+        for title in md.findall('dc:title', ns):
+            ref = '#' + (title.get('id') or '-')
+            if any(m.get('refines') == ref and m.get('property') == 'title-type'
+                   and (m.text or '').strip() == 'subtitle' for m in md.findall('opf:meta', ns)):
+                subtitle = (title.text or '').strip() or None
+        isbn = None
+        for ident in md.findall('dc:identifier', ns):
+            text = (ident.text or '').strip()
+            scheme = ''.join(v for k, v in ident.attrib.items() if k.endswith('scheme')).lower()
+            digits = re.sub(r'[^0-9Xx]', '', text.rpartition(':')[2])
+            if (scheme == 'isbn' or 'isbn' in text.lower()) and len(digits) in (10, 13):
+                isbn = digits.upper()
+                break
+        date = (md.findtext('dc:date', default='', namespaces=ns) or '').strip()
+        date = date[:10] if re.match(r'\d{4}-\d{2}-\d{2}', date) else (
+            date[:4] + '-01-01' if re.match(r'\d{4}', date) else None)
+        if date and date.startswith('0101'):   # Calibre's "unknown date"
+            date = None
+        return {'description': description[:20000] or None, 'subtitle': subtitle, 'isbn': isbn,
+                'date': date}
 
     def _series(self, md):
         """Series name and position from Calibre or EPUB 3 metadata, else (None, None)."""
@@ -906,6 +937,12 @@ def content_item(h, book, added):
         'contentIsPreview': False,
         'language': book['language'],
         'publisher': book['publisher'],
+        # Synopsis and details screen. Without a subtitle of its own a book shows its series
+        # position there ("Mistborn #2"), the closest the reader gets to showing series.
+        'abstract': book['description'],
+        'subtitle': book['subtitle'] or series_label(book) or None,
+        'isbnEan': book['isbn'],
+        'issuedDate': book['date'] + 'T00:00:00Z' if book['date'] else None,
         'purchasedDate': added,
         'resellerId': RESELLER_ID,
         'resellerName': h.server.cfg.brand,
@@ -927,7 +964,8 @@ def inventory(h):
     present = {b['uuid'] for b in books}
     deleted = {u: ts for u, ts in deleted.items() if u not in present}
     last_modified = max([b['mtime'] for b in books] + list(deleted.values())
-                        + list(h.ctx.shelf.values()) + [h.server.series.modified()] or [0])
+                        + list(h.ctx.shelf.values()) + [h.server.series.modified(),
+                                                        INVENTORY_FORMAT_CHANGED])
     # The device sends back lastModifiedDate as If-Modified-Since. Answering 200 every time
     # makes it re-import every book, which resets read status and position (seen on device).
     since = h.headers.get('If-Modified-Since')

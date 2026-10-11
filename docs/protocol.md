@@ -151,6 +151,9 @@ firmware mentions `calibre:series` or `belongs-to-collection`, so series metadat
 not read either. The Tolino-mode library offers no series sort (Recent, Date added, Title,
 Author, File size, File type).
 
+`abstract` (HTML) is the Synopsis tab; `subtitle` shows under the title. The reader only
+re-reads books when `lastModifiedDate` grows, so new inventory fields need a bump of it.
+
 `purchasedDate` (epoch ms) ends up verbatim in `content.DateAdded`, which the "Date added"
 sort uses.
 
