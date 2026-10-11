@@ -928,6 +928,37 @@ def inventory(h):
     })
 
 
+# "Delete" on the reader (for a book from the library, not just the download) queues the book
+# and sends the queue to /v1/inventory at the next sync. Only the request target is known from
+# the firmware, not its exact format, so every book id (40 hex digits) in the query or body
+# counts. Shared books leave the user's shelf; own books move to <user>/.deleted/ (the library
+# ignores subfolders), so a mistaken delete can be undone by moving the file back.
+BOOK_ID = re.compile(r'\b[0-9a-f]{40}\b')
+
+
+@route('DELETE', r'/v1/inventory', 'token')
+@route('POST', r'/v1/inventory', 'token')
+@route('PATCH', r'/v1/inventory', 'token')
+def delete_from_inventory(h):
+    text = urllib.parse.unquote(h.path) + ' ' + (h.body or b'').decode('utf-8', 'replace')
+    removed = []
+    for uuid in dict.fromkeys(BOOK_ID.findall(text)):
+        book = h.ctx.library.find(uuid)
+        if book is None:
+            continue
+        if book['shared']:
+            h.ctx.remove_from_shelf(uuid)
+        else:
+            trash = book['path'].parent / '.deleted'
+            trash.mkdir(exist_ok=True)
+            book['path'].rename(trash / book['path'].name)
+            h.server.record_deletion(h.user, uuid)
+        removed.append(uuid)
+    print('reader deleted %d of %d books for %s' % (
+        len(removed), len(set(BOOK_ID.findall(text))), h.user), flush=True)
+    h._send_json({'deleted': removed})
+
+
 @route('GET', r'/v1/inventory/([^/]+)/downloadinfo', 'token')
 def download_info(h, uuid):
     book = h.ctx.library.find(uuid)

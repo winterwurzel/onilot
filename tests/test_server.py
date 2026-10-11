@@ -862,6 +862,26 @@ class DeviceFlowTest(unittest.TestCase):
         _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
         self.assertGreater(json.loads(body)['lastModifiedDate'], before)
 
+    def test_deleting_on_the_reader_removes_books_from_the_library(self):
+        token, books = self.new_user('del', [('Own One', '', '')])
+        shared = self.shared_uuid('Shared Book')
+        self.store_add(token, shared)
+        self.assertEqual(self.request('DELETE', '/v1/inventory?uuids=' + shared)[0], 401)
+        body = json.dumps({'items': [{'uuid': shared}, {'uuid': books['Own One']},
+                                     {'uuid': 'f' * 40}]}).encode()
+        status, _, resp = self.request('DELETE', '/v1/inventory', body=body,
+                                       headers={**self.auth(token),
+                                                'Content-Type': 'application/json'})
+        self.assertEqual(status, 200)
+        self.assertEqual(sorted(json.loads(resp)['deleted']), sorted([shared, books['Own One']]))
+        _, _, page = self.request('GET', '/shop', headers={'X-Access-Token': token})
+        self.assertNotIn(b'In your library', page)
+        _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
+        inv = json.loads(body)
+        self.assertEqual([i['title'] for i in inv['page']['content']], [])
+        self.assertTrue({'uuid': books['Own One']} in inv['deletedContent'])
+        self.assertTrue((self.lib / 'del' / '.deleted' / '0.epub').exists())  # recoverable
+
     def test_store_pages_and_finds_series(self):
         make_series_epub(self.lib / 'shared' / 'tale1.epub', 'Tale Begins', 'Long Tale', '1')
         make_series_epub(self.lib / 'shared' / 'tale2.epub', 'Tale Ends', 'Long Tale', '2')
