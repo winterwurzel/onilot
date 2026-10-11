@@ -146,7 +146,13 @@ the reader's revision is not sent at all. Bookmarks always go out as `replace` (
 
 The inventory parser of firmware 5.18 reads only `abstract`, `authors`, `contentFormat`,
 `contentType`, `isbnEan`, `issuedDate`, `language`, `publisher`, `subtitle`, `title` and
-`uuid` from a content item; there is no field for a series name or number.
+`uuid` from a content item; there is no field for a series name or number. No file in the
+firmware mentions `calibre:series` or `belongs-to-collection`, so series metadata in EPUBs is
+not read either. The Tolino-mode library offers no series sort (Recent, Date added, Title,
+Author, File size, File type).
+
+`purchasedDate` (epoch ms) ends up verbatim in `content.DateAdded`, which the "Date added"
+sort uses.
 
 ## Uploads of sideloaded books
 
