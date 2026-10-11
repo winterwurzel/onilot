@@ -352,21 +352,29 @@ class DeviceFlowTest(unittest.TestCase):
         status, _, _ = self.upload(tokens['access_token'], 'x.epub', b'not a zip')
         self.assertEqual(status, 400)
 
-    def test_recommendations_are_a_list_of_library_books(self):
+    def test_recommendations_suggest_shared_books_not_yet_added(self):
         tokens, _ = self.login()
         self.assertEqual(self.request('GET', '/v2/recommendations')[0], 401)
-        status, _, body = self.request('GET', '/v2/recommendations?count=12&type=ebook',
-                                       headers=self.auth(tokens['access_token']))
-        recos = json.loads(body)
-        self.assertEqual(status, 200)
-        self.assertIsInstance(recos, list)
-        self.assertIn('Test Book', [r['title'] for r in recos])
-        self.assertTrue(all(r['cover_url'] and r['shop_url'] for r in recos))
+
+        def recos():
+            status, _, body = self.request('GET', '/v2/recommendations?count=12&type=ebook',
+                                           headers=self.auth(tokens['access_token']))
+            self.assertEqual(status, 200)
+            return json.loads(body)
+        first = recos()
+        self.assertIsInstance(first, list)
+        self.assertIn('Shared Book', [r['title'] for r in first])
+        self.assertNotIn('Test Book', [r['title'] for r in first])  # own books are not suggested
+        shared = next(r for r in first if r['title'] == 'Shared Book')
+        self.assertIn('/shop?id=' + shared['publicationId'], shared['shop_url'])
+        self.store_add(tokens['access_token'], shared['publicationId'])
+        self.assertNotIn('Shared Book', [r['title'] for r in recos()])
+        self.store_add(tokens['access_token'], shared['publicationId'], 'remove')
 
     def test_shop_accepts_concatenated_url(self):
         status, _, body = self.request('GET', '/shophttps://books.example.com/onilotapi/shop')
         self.assertEqual(status, 200)
-        self.assertIn(b'<h1>onilot</h1>', body)
+        self.assertIn(b'onilot store', body)
 
     def test_tags_are_a_list_per_publication(self):
         tokens, _ = self.login()
@@ -429,13 +437,30 @@ class DeviceFlowTest(unittest.TestCase):
         _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
         return {i['title']: i for i in json.loads(body)['page']['content']}
 
-    def test_users_see_own_and_shared_books_only(self):
+    def shared_uuid(self, title):
+        import hashlib
+        name = {'Shared Book': 'shared.epub', 'Admin Upload': 'admin-up.epub'}[title]
+        return hashlib.sha1(('shared/' + name).encode()).hexdigest()
+
+    def store_add(self, token, uuid, verb='add', header=True, form_token=False):
+        form = {'q': ''}
+        if form_token:
+            form['t'] = token
+        return self.request('POST', '/shop/%s/%s' % (verb, uuid), form=form,
+                            headers={'X-Access-Token': token} if header else {})
+
+    def test_users_see_only_own_books_until_they_add_shared_ones(self):
         alice, _ = self.login()
         bob, _ = self.login('bob', BOB_PASSWORD)
-        self.assertEqual(set(self.inventory_titles(alice['access_token'])) & {'Test Book',
-                         'Shared Book'}, {'Test Book', 'Shared Book'})
+        self.assertIn('Test Book', self.inventory_titles(alice['access_token']))
         self.assertNotIn('Test Book', self.inventory_titles(bob['access_token']))
+        self.assertNotIn('Shared Book', self.inventory_titles(bob['access_token']))
+        status, headers, _ = self.store_add(bob['access_token'], self.shared_uuid('Shared Book'))
+        self.assertEqual(status, 303)
+        self.assertIn('Added', urllib.parse.unquote_plus(headers['Location']))
         self.assertIn('Shared Book', self.inventory_titles(bob['access_token']))
+        self.assertNotIn('Shared Book', self.inventory_titles(alice['access_token']))
+        self.store_add(bob['access_token'], self.shared_uuid('Shared Book'), 'remove')
 
     def test_access_token_names_the_user(self):
         bob, _ = self.login('bob', BOB_PASSWORD)
@@ -478,6 +503,55 @@ class DeviceFlowTest(unittest.TestCase):
         self.assertTrue((self.lib / 'bob' / 'bobs.epub').exists())
         alice, _ = self.login()
         self.assertNotIn('Bob Upload', self.inventory_titles(alice['access_token']))
+
+
+    def test_store_shows_add_buttons_only_with_token(self):
+        bob, _ = self.login('bob', BOB_PASSWORD)
+        _, _, anonymous = self.request('GET', '/shop')
+        self.assertIn(b'Shared Book', anonymous)
+        self.assertNotIn(b'Add to my library', anonymous)
+        _, _, page = self.request('GET', '/shop', headers={'X-Access-Token': bob['access_token']})
+        self.assertIn(b'Add to my library', page)
+        self.assertIn(b'/covers/bob/', page)
+
+    def test_store_actions_need_a_token(self):
+        uuid = self.shared_uuid('Shared Book')
+        status, _, _ = self.request('POST', '/shop/add/' + uuid, form={'q': ''})
+        self.assertEqual(status, 401)
+        status, _, _ = self.request('POST', '/shop/add/' + uuid, form={'t': 'a.b.c'})
+        self.assertEqual(status, 401)
+
+    def test_store_form_token_fallback(self):
+        bob, _ = self.login('bob', BOB_PASSWORD)
+        uuid = self.shared_uuid('Shared Book')
+        status, _, _ = self.store_add(bob['access_token'], uuid, header=False, form_token=True)
+        self.assertEqual(status, 303)
+        self.assertIn('Shared Book', self.inventory_titles(bob['access_token']))
+        self.store_add(bob['access_token'], uuid, 'remove')
+
+    def test_shared_download_needs_adding_and_removal_reaches_reader(self):
+        bob, _ = self.login('bob', BOB_PASSWORD)
+        token = bob['access_token']
+        uuid = self.shared_uuid('Shared Book')
+        info = '/v1/inventory/%s/downloadinfo' % uuid
+        self.assertEqual(self.request('GET', info, headers=self.auth(token))[0], 404)
+        _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
+        before = json.loads(body)['lastModifiedDate']
+        time.sleep(0.01)
+        self.store_add(token, uuid)
+        _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
+        self.assertGreater(json.loads(body)['lastModifiedDate'], before)  # no 304 after adding
+        self.assertEqual(self.request('GET', info, headers=self.auth(token))[0], 200)
+        self.store_add(token, uuid, 'remove')
+        _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
+        inv = json.loads(body)
+        self.assertIn({'uuid': uuid}, inv['deletedContent'])
+        self.assertEqual(self.request('GET', info, headers=self.auth(token))[0], 404)
+        # adding again takes it off the deleted list
+        self.store_add(token, uuid)
+        _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
+        self.assertNotIn({'uuid': uuid}, json.loads(body)['deletedContent'])
+        self.store_add(token, uuid, 'remove')
 
     def test_shop_shows_only_shared_books(self):
         status, _, body = self.request('GET', '/shop')
@@ -624,6 +698,8 @@ class DeviceFlowTest(unittest.TestCase):
                                     body=body, headers=headers)
         self.assertEqual(status, 200)
         bob, _ = self.login('bob', BOB_PASSWORD)
+        self.assertNotIn('Admin Upload', self.inventory_titles(bob['access_token']))
+        self.store_add(bob['access_token'], self.shared_uuid('Admin Upload'))
         item = self.inventory_titles(bob['access_token'])['Admin Upload']
         status, _, page = self.request('GET', self.origin + '/admin/library?owner=shared',
                                        headers={'Cookie': cookie})

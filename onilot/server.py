@@ -99,8 +99,9 @@ class Library:
     _meta_cache = {}
     _meta_lock = threading.Lock()
 
-    def __init__(self, roots):
+    def __init__(self, roots, shelf=None):
         self.roots = [(Path(d), prefix, shared) for d, prefix, shared in roots]
+        self.shelf = shelf  # if given: only shared books whose uuid is on it
 
     def books(self):
         result = []
@@ -108,6 +109,8 @@ class Library:
             for path in sorted(root.glob('*.epub')):
                 stat = path.stat()
                 uuid = hashlib.sha1((prefix + path.name).encode()).hexdigest()
+                if shared and self.shelf is not None and uuid not in self.shelf:
+                    continue
                 result.append({'uuid': uuid, 'path': path, 'size': stat.st_size,
                                'mtime': int(stat.st_mtime * 1000), 'shared': shared,
                                **self._cached_metadata(path, stat)})
@@ -643,7 +646,8 @@ def inventory(h):
     deleted = h.server.deletions_for(h.user)
     present = {b['uuid'] for b in books}
     deleted = {u: ts for u, ts in deleted.items() if u not in present}
-    last_modified = max([b['mtime'] for b in books] + list(deleted.values()) or [0])
+    last_modified = max([b['mtime'] for b in books] + list(deleted.values())
+                        + list(h.ctx.shelf.values()) or [0])
     # The device sends back lastModifiedDate as If-Modified-Since. Answering 200 every time
     # makes it re-import every book, which resets read status and position (seen on device).
     since = h.headers.get('If-Modified-Since')
@@ -692,7 +696,7 @@ def content(h, kind, *rest):
 @route('GET', r'/(covers)/([0-9a-f]{40})/(\d+)/([0-9a-f]{64})', 'signed')
 def cover(h, kind, *rest):
     uuid = rest[-3]
-    book = h.ctx.library.find(uuid)
+    book = h.ctx.library.find(uuid) or h.server.shared_library().find(uuid)
     data, mime = h.ctx.library.cover_bytes(book) if book else (None, None)
     if data is None:
         h._send_json({'error': 'no cover'}, 404)
@@ -702,27 +706,101 @@ def cover(h, kind, *rest):
 
 # ---- shop tab (webview) -----------------------------------------------------------------
 
-SHOP_PAGE = """<!doctype html><html><head><meta name=viewport content="width=device-width">
-<title>{brand}</title></head><body style="font-family:sans-serif;font-size:1.3em">
-<h1>{brand}</h1><p>{count} shared books. Shared and your own books appear in your library
-after a sync; Settings &gt; account &gt; Link Library shows all of yours.</p><ul>{items}</ul>
-</body></html>"""
+STORE_CSS = """
+body { margin:0; font:20px/1.45 sans-serif; color:#000; background:#fff; }
+header { padding:.8em 1em; border-bottom:2px solid #000; display:flex; gap:1em;
+  align-items:center; flex-wrap:wrap; }
+header h1 { font-size:1.3em; margin:0; flex:1; }
+form.search { display:flex; gap:.4em; } input[type=search] { font:inherit; padding:.3em .5em;
+  border:2px solid #000; border-radius:6px; width:11em; }
+main { padding:1em; } .note { border:2px solid #000; border-radius:8px; padding:.6em .8em;
+  margin-bottom:1em; } .book { display:flex; gap:1em; padding:1em 0; border-bottom:1px solid #000; }
+.book img, .book .ph { width:5.5em; height:8.2em; object-fit:cover; border:1px solid #000;
+  flex:none; display:grid; place-items:center; font-size:1.6em; font-weight:700; }
+.book h2 { font-size:1.05em; margin:0 0 .2em; } .by { margin:0 0 .6em; }
+button { font:inherit; padding:.35em .9em; border:2px solid #000; border-radius:8px;
+  background:#fff; color:#000; } button.add { background:#000; color:#fff; }
+.owned { font-weight:700; margin-right:.6em; } .empty { padding:2em 0; text-align:center; }
+"""
 
 
+def store_page(h, books, query, focus):
+    brand = html.escape(h.server.cfg.brand)
+    token = next((v for k, v in h.headers.items() if k.lower() == 'x-access-token'), '')
+    rows = []
+    for b in books:
+        owned = h.user and b['uuid'] in h.ctx.shelf
+        cover = ('<img src="%s" alt="">' % html.escape(h._signed_url('covers', b['uuid']))
+                 if h.user and b['cover'] else
+                 '<span class="ph">%s</span>' % html.escape(b['title'][:1]))
+        if not h.user:
+            action = ''
+        else:
+            verb = 'remove' if owned else 'add'
+            action = ('<form method=post action="%s"><input type=hidden name=t value="%s">'
+                      '<input type=hidden name=q value="%s">%s<button class="%s">%s</button>'
+                      '</form>' % (html.escape(h._url('/shop/%s/%s' % (verb, b['uuid']))),
+                                   html.escape(token), html.escape(query),
+                                   '<span class="owned">In your library</span>' if owned else '',
+                                   '' if owned else 'add',
+                                   'Remove' if owned else 'Add to my library'))
+        rows.append('<div class="book"%s>%s<div><h2>%s</h2><p class="by">%s</p>%s</div></div>' % (
+            ' id="focus"' if b['uuid'] == focus else '', cover, html.escape(b['title']),
+            html.escape(', '.join(b['authors'])), action))
+    message = h.query.get('msg', [''])[0]
+    notes = ('<div class="note">%s</div>' % html.escape(message)) if message else ''
+    if not h.user:
+        notes += '<div class="note">Open the store on your reader to add books.</div>'
+    doc = """<!doctype html><html><head><meta charset="utf-8">
+<meta name=viewport content="width=device-width"><title>{brand}</title><style>{css}</style>
+</head><body><header><h1>{brand} store</h1><form class="search" action="{action}">
+<input type=search name=q value="{q}" placeholder="Title or author"><button>Search</button>
+</form></header><main>{notes}{rows}</main>
+<script>var f = document.getElementById('focus'); if (f) f.scrollIntoView();</script>
+</body></html>""".format(brand=brand, css=STORE_CSS, action=html.escape(h._url('/shop')),
+                         q=html.escape(query), notes=notes,
+                         rows=''.join(rows) or '<div class="empty">No books found.</div>')
+    h._send(200, doc.encode(), 'text/html; charset=UTF-8')
+
+
+# The shop tab is the store for the shared library: each user adds the shared books they want;
+# only those (plus their own books) appear in their library. The reader's shop webview sends
+# the access token as X-Access-Token, so the store knows the user.
 # Some shop entry points concatenate SHOP_BASE + URL_SHOP_EBOOK_START_PAGE, producing
 # /shophttps://<host>/<prefix>/shop, so accept anything after /shop.
 @route('GET', r'/shop(?:https?://.*)?')
 def shop(h):
-    # The shop webview sends no token, so it can only show the shared library.
-    query = h.query.get('q', [''])[0].lower()
-    books = [b for b in h.server.shared_library().books()
-             if query in b['title'].lower() or any(query in a.lower() for a in b['authors'])]
-    items = ''.join('<li>%s%s</li>' % (html.escape(b['title']),
-                                        ' &ndash; ' + html.escape(', '.join(b['authors']))
-                                        if b['authors'] else '') for b in books)
-    page = SHOP_PAGE.format(brand=html.escape(h.server.cfg.brand), count=len(books),
-                            items=items)
-    h._send(200, page.encode(), 'text/html; charset=UTF-8')
+    query = h.query.get('q', [''])[0].strip()
+    focus = h.query.get('id', [''])[0]
+    needle = query.lower()
+    books = [b for b in sorted(h.server.shared_library().books(), key=lambda b: -b['mtime'])
+             if not needle or needle in b['title'].lower()
+             or any(needle in a.lower() for a in b['authors'])]
+    store_page(h, books, query, focus)
+
+
+@route('POST', r'/shop/(add|remove)/([0-9a-f]{40})')
+def shop_action(h, verb, uuid):
+    form = h._form()
+    # The token arrives as a header on the reader; the form copy is a fallback in case the
+    # webview does not add it to form posts.
+    user = h.user or h.server.access_user(form.get('t', ''))
+    if not user:
+        h._send_json({'error': 'unauthorized'}, 401)
+        return
+    h.user = user
+    book = h.server.shared_library().find(uuid)
+    if book is None:
+        message = 'That book is no longer in the store.'
+    elif verb == 'add':
+        h.ctx.add_to_shelf(uuid)
+        message = ('Added "%s". It appears in your library after the next sync '
+                   '(Settings > account > Link Library > Sync now).' % book['title'])
+    else:
+        h.ctx.remove_from_shelf(uuid)
+        message = 'Removed "%s"; it leaves your reader at the next sync.' % book['title']
+    query = urllib.parse.urlencode({'q': form.get('q', ''), 'id': uuid, 'msg': message})
+    h._send(303, b'', 'text/plain', {'Location': h._url('/shop?' + query)})
 
 
 # ---- uploads of sideloaded books (device pushes them automatically) ----------------------
@@ -790,7 +868,9 @@ def user_upload_cover(h, uuid):
 @route('GET', r'/v2/recommendations', 'token')
 def recommendations(h):
     count = int(h.query.get('count', ['12'])[0])
-    books = sorted(h.ctx.library.books(), key=lambda b: b['mtime'], reverse=True)[:count]
+    # Suggest shared books the user has not added yet; tapping one opens it in the store.
+    books = [b for b in sorted(h.server.shared_library().books(), key=lambda b: -b['mtime'])
+             if b['uuid'] not in h.ctx.shelf][:count]
     # Top-level array; tapping an entry opens shop_url in the shop webview.
     h._send_json([{
         'publicationId': b['uuid'],
@@ -799,7 +879,7 @@ def recommendations(h):
         'cover_url': h._signed_url('covers', b['uuid']),
         'description': '',
         'publicationType': h.query.get('type', ['ebook'])[0],
-        'shop_url': h._url('/shop?q=' + urllib.parse.quote(b['title'])),
+        'shop_url': h._url('/shop?id=' + b['uuid']),
     } for b in books])
 
 
@@ -935,8 +1015,12 @@ class UserContext:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.library_dir = Path(server.cfg.library) / name
         self.library_dir.mkdir(parents=True, exist_ok=True)
+        self.server = server
+        # Shared books the user added from the store: uuid -> added at (ms).
+        self.shelf_path = self.dir / 'shelf.json'
+        self.shelf = json.loads(self.shelf_path.read_text()) if self.shelf_path.exists() else {}
         self.library = Library([(self.library_dir, '', False),
-                                (server.shared_dir, 'shared/', True)])
+                                (server.shared_dir, 'shared/', True)], shelf=self.shelf)
         self.state = State(self.dir)
         self.lock = threading.Lock()
         self.devices_path = self.dir / 'devices.json'
@@ -958,6 +1042,19 @@ class UserContext:
                     entry[field] = headers[field][:limit]
             if now - previous > 60:  # do not rewrite the file on every request
                 self.devices_path.write_text(json.dumps(self.devices, indent=1))
+
+    def add_to_shelf(self, uuid):
+        with self.lock:
+            self.shelf[uuid] = int(time.time() * 1000)
+            self.shelf_path.write_text(json.dumps(self.shelf, indent=1))
+        self.server.clear_deletion(self.name, uuid)
+
+    def remove_from_shelf(self, uuid):
+        with self.lock:
+            if self.shelf.pop(uuid, None) is None:
+                return
+            self.shelf_path.write_text(json.dumps(self.shelf, indent=1))
+        self.server.record_deletion(self.name, uuid)  # the reader removes it at its next sync
 
     def is_upload(self, book):
         return not book['shared'] and book['path'].name in self.uploads
@@ -1010,6 +1107,11 @@ class Server(ThreadingHTTPServer):
         with self.deletions_lock:
             self.deletions.setdefault(owner, {})[uuid] = int(time.time() * 1000)
             self.deletions_path.write_text(json.dumps(self.deletions, indent=1))
+
+    def clear_deletion(self, owner, uuid):
+        with self.deletions_lock:
+            if self.deletions.get(owner, {}).pop(uuid, None) is not None:
+                self.deletions_path.write_text(json.dumps(self.deletions, indent=1))
 
     def deletions_for(self, user):
         result = dict(self.deletions.get('shared', {}))
