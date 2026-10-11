@@ -66,7 +66,7 @@ def b64url(data):
 
 
 SECRET_FIELDS = re.compile(
-    r'((?:password|code|refresh_token|access_token|client_secret)["\']?\s*[=:]\s*["\']?)'
+    r'((?:password|code|refresh_token|access_token|client_secret|csrf)["\']?\s*[=:]\s*["\']?)'
     r'[^&"\'\s,}]+')
 BEARER = re.compile(r'[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}')
 
