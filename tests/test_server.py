@@ -36,6 +36,23 @@ CONTAINER = """<?xml version="1.0"?>
   media-type="application/oebps-package+xml"/></rootfiles></container>"""
 
 
+def make_epub_without_cover(path, title, first_page_image=False):
+    """No cover-image property; optionally an image referenced from the first page."""
+    opf = OPF.replace('{title}', title).replace(
+        '<item id="c" href="cover.jpg" media-type="image/jpeg" properties="cover-image"/>',
+        '<item id="p1" href="text/p1.xhtml" media-type="application/xhtml+xml"/>' +
+        ('<item id="pic" href="img/front.png" media-type="image/png"/>' if first_page_image
+         else '')).replace('<spine/>', '<spine><itemref idref="p1"/></spine>')
+    with zipfile.ZipFile(path, 'w') as z:
+        z.writestr('mimetype', 'application/epub+zip')
+        z.writestr('META-INF/container.xml', CONTAINER)
+        z.writestr('OEBPS/content.opf', opf)
+        z.writestr('OEBPS/text/p1.xhtml', '<html><body>%s<p>Hello</p></body></html>' % (
+            '<img src="../img/front.png"/>' if first_page_image else ''))
+        if first_page_image:
+            z.writestr('OEBPS/img/front.png', b'\x89PNGfake')
+
+
 def make_epub(path, title='Test Book'):
     with zipfile.ZipFile(path, 'w') as z:
         z.writestr('mimetype', 'application/epub+zip')
@@ -552,6 +569,33 @@ class DeviceFlowTest(unittest.TestCase):
         _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
         self.assertNotIn({'uuid': uuid}, json.loads(body)['deletedContent'])
         self.store_add(token, uuid, 'remove')
+
+    def test_cover_fallbacks(self):
+        alice, _ = self.login()
+        make_epub_without_cover(self.lib / 'alice' / 'nocover.epub', 'A Book Without Any Cover')
+        make_epub_without_cover(self.lib / 'alice' / 'firstpage.epub', 'First Page Picture',
+                                first_page_image=True)
+        items = self.inventory_titles(alice['access_token'])
+        status, headers, body = self.request(
+            'GET', items['A Book Without Any Cover']['fileResources'][0]['resource'])
+        self.assertEqual(status, 200)
+        self.assertEqual(headers['Content-Type'], 'image/svg+xml')
+        self.assertIn(b'A Book Without', body)
+        self.assertIn(b'<svg', body)
+        status, headers, body = self.request(
+            'GET', items['First Page Picture']['fileResources'][0]['resource'])
+        self.assertEqual((status, headers['Content-Type'], body), (200, 'image/png',
+                                                                   b'\x89PNGfake'))
+        (self.lib / 'alice' / 'nocover.epub').unlink()
+        (self.lib / 'alice' / 'firstpage.epub').unlink()
+
+    def test_generated_cover_escapes_title(self):
+        import importlib
+        sys.path.insert(0, str(REPO))
+        server = importlib.import_module('onilot.server')
+        svg = server.generated_cover('<script>alert(1)</script> & more', 'A & B')
+        self.assertNotIn(b'<script>', svg)
+        self.assertIn(b'&amp;', svg)
 
     def test_shop_shows_only_shared_books(self):
         status, _, body = self.request('GET', '/shop')

@@ -145,33 +145,107 @@ class Library:
                                                namespaces=self.OPF_NS)
                 meta['publisher'] = md.findtext('dc:publisher', default=None,
                                                 namespaces=self.OPF_NS)
-                meta['cover'] = self._cover_href(opf, opf_path)
+                meta['cover'] = self._cover_href(opf, opf_path, z)
         except (KeyError, ET.ParseError, zipfile.BadZipFile, AttributeError) as exc:
             print('warning: cannot read metadata of %s: %s' % (path.name, exc))
         return meta
 
-    def _cover_href(self, opf, opf_path):
+    IMAGE_TYPES = ('image/jpeg', 'image/png', 'image/gif', 'image/webp')
+
+    def _cover_href(self, opf, opf_path, z):
+        """Find the cover image: tagged cover, an image called "cover", the image on the first
+        page, or the first image in the book. None if the book has no images at all."""
         manifest = opf.find('opf:manifest', self.OPF_NS)
         if manifest is None:
             return None
+        base = opf_path.rsplit('/', 1)[0] + '/' if '/' in opf_path else ''
         items = manifest.findall('opf:item', self.OPF_NS)
+        images = [i for i in items if (i.get('media-type') or '') in self.IMAGE_TYPES]
         cover = next((i for i in items if 'cover-image' in (i.get('properties') or '')), None)
         if cover is None:
             meta = opf.find(".//opf:meta[@name='cover']", self.OPF_NS)
             if meta is not None:
                 cover = next((i for i in items if i.get('id') == meta.get('content')), None)
         if cover is None:
+            cover = next((i for i in images if 'cover' in (i.get('id', '') + i.get('href', ''))
+                          .lower()), None)
+        if cover is not None:
+            return urllib.parse.unquote(base + cover.get('href'))
+        first_page = self._first_page_image(opf, items, base, z)
+        if first_page:
+            return first_page
+        return urllib.parse.unquote(base + images[0].get('href')) if images else None
+
+    def _first_page_image(self, opf, items, base, z):
+        spine = opf.find('opf:spine', self.OPF_NS)
+        first = spine.find('opf:itemref', self.OPF_NS) if spine is not None else None
+        page = next((i for i in items if first is not None
+                     and i.get('id') == first.get('idref')), None)
+        if page is None:
             return None
-        base = opf_path.rsplit('/', 1)[0] + '/' if '/' in opf_path else ''
-        return urllib.parse.unquote(base + cover.get('href'))
+        page_path = urllib.parse.unquote(base + page.get('href'))
+        try:
+            text = z.read(page_path).decode('utf-8', 'replace')
+        except KeyError:
+            return None
+        match = re.search(r'<(?:img[^>]+src|image[^>]+(?:xlink:)?href)\s*=\s*["\']([^"\']+)',
+                          text, re.I)
+        if not match:
+            return None
+        folder = page_path.rsplit('/', 1)[0] + '/' if '/' in page_path else ''
+        target = os.path.normpath(folder + urllib.parse.unquote(match.group(1))).replace('\\', '/')
+        return target if target in z.namelist() else None
 
     def cover_bytes(self, book):
-        if not book['cover']:
-            return None, None
-        with zipfile.ZipFile(book['path']) as z:
-            data = z.read(book['cover'])
-        mime = 'image/png' if book['cover'].lower().endswith('.png') else 'image/jpeg'
-        return data, mime
+        """Cover image bytes and type; books without any image get a generated SVG cover."""
+        if book['cover']:
+            with zipfile.ZipFile(book['path']) as z:
+                data = z.read(book['cover'])
+            lower = book['cover'].lower()
+            mime = ('image/png' if lower.endswith('.png') else 'image/gif' if
+                    lower.endswith('.gif') else 'image/webp' if lower.endswith('.webp') else
+                    'image/jpeg')
+            return data, mime
+        return generated_cover(book['title'], ', '.join(book['authors'])), 'image/svg+xml'
+
+
+def wrap_text(text, width, max_lines):
+    lines, line = [], ''
+    for word in text.split():
+        if line and len(line) + 1 + len(word) > width:
+            lines.append(line)
+            line = word
+        else:
+            line = (line + ' ' + word).strip()
+    if line:
+        lines.append(line)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = lines[-1][:width - 1].rstrip() + '…'
+    return lines
+
+
+def generated_cover(title, author):
+    """A plain, high-contrast SVG cover (the reader's image loader handles SVG)."""
+    shade = 30 + int(hashlib.sha1(title.encode()).hexdigest()[:2], 16) % 50
+    title_lines = wrap_text(title, 14, 6)
+    author_lines = wrap_text(author, 22, 2)
+    y = 560 - len(title_lines) * 60
+    texts = []
+    for line in title_lines:
+        texts.append('<text x="600" y="%d" font-size="110" font-weight="bold">%s</text>' % (
+            y, html.escape(line)))
+        y += 135
+    y = max(y + 90, 1420)
+    for line in author_lines:
+        texts.append('<text x="600" y="%d" font-size="64">%s</text>' % (y, html.escape(line)))
+        y += 85
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1800" '
+           'viewBox="0 0 1200 1800"><rect width="1200" height="1800" fill="hsl(0 0%% %d%%)"/>'
+           '<rect x="60" y="60" width="1080" height="1680" fill="none" stroke="#fff" '
+           'stroke-width="8"/><g fill="#fff" text-anchor="middle" '
+           'font-family="serif">%s</g></svg>' % (shade, ''.join(texts)))
+    return svg.encode()
 
 
 class State:
@@ -731,7 +805,7 @@ def store_page(h, books, query, focus):
     for b in books:
         owned = h.user and b['uuid'] in h.ctx.shelf
         cover = ('<img src="%s" alt="">' % html.escape(h._signed_url('covers', b['uuid']))
-                 if h.user and b['cover'] else
+                 if h.user else
                  '<span class="ph">%s</span>' % html.escape(b['title'][:1]))
         if not h.user:
             action = ''

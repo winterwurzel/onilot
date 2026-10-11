@@ -496,8 +496,7 @@ def admin_library(h):
             '<input type=hidden name=action value=delete><button class="danger small">Delete'
             '</button></form></div></div></div>' % (
                 '<img src="%s" alt="%s" loading="lazy" '
-                'onerror="this.parentNode.textContent=this.alt">' % (cover_url, initial)
-                if b['cover'] else initial,
+                'onerror="this.parentNode.textContent=this.alt">' % (cover_url, initial),
                 esc(b['title']), esc(', '.join(b['authors'])), b['size'] / 1e6,
                 esc(h._admin_url('/library/%s/%s' % (owner, b['uuid']))), esc(b['title']),
                 esc(h.csrf)))
