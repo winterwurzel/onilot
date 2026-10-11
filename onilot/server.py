@@ -337,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
                     if guard == 'token' and not self.user:
                         self._send_json({'error': 'unauthorized'}, 401)
                     elif guard == 'admin' and not self._admin_session():
-                        self._redirect('/admin')
+                        self._send(303, b'', 'text/plain', {'Location': self._admin_url()})
                     elif guard == 'signed' and not self._has_valid_signature(*m.groups()):
                         self._send_json({'error': 'bad or expired signature'}, 403)
                     else:
@@ -435,6 +435,9 @@ class Handler(BaseHTTPRequestHandler):
     @property
     def ctx(self):
         return self.server.context(self.user)
+
+    def _admin_url(self, suffix=''):
+        return self.server.cfg.origin + '/admin' + suffix
 
     def _redirect(self, path):
         self._send(303, b'', 'text/plain', {'Location': self._url(path)})
@@ -933,8 +936,7 @@ def admin_message(h):
 
 
 def admin_cookie(h, sid, max_age):
-    flags = 'Path=%s/admin; HttpOnly; SameSite=Strict; Max-Age=%d' % (h.server.cfg.prefix,
-                                                                        max_age)
+    flags = 'Path=/admin; HttpOnly; SameSite=Strict; Max-Age=%d' % max_age
     if h.server.cfg.secure_cookies:
         flags += '; Secure'
     return {'Set-Cookie': 'onilot_admin=%s; %s' % (sid, flags)}
@@ -942,9 +944,12 @@ def admin_cookie(h, sid, max_age):
 
 @route('GET', r'/admin')
 def admin_index(h):
+    if urllib.parse.urlsplit(h.path).path != '/admin':  # reached as <prefix>/admin
+        h._send(301, b'', 'text/plain', {'Location': h._admin_url()})
+        return
     if not h._admin_session():
         admin_html(h, ADMIN_LOGIN.format(message=admin_message(h),
-                                         action=html.escape(h._url('/admin/login'))))
+                                         action=html.escape(h._admin_url('/login'))))
         return
     csrf = html.escape(h.csrf)
 
@@ -953,7 +958,7 @@ def admin_index(h):
             if confirm else ''
         return ('<form class=inline method=post action="%s"%s>'
                 '<input type=hidden name=csrf value="%s">%s<button>%s</button></form> ' % (
-                    html.escape(h._url('/admin/users')), onsubmit, csrf,
+                    html.escape(h._admin_url('/users')), onsubmit, csrf,
                     ''.join('<input type=hidden name="%s" value="%s">' % (k, html.escape(v))
                             for k, v in fields.items()) + action, label))
 
@@ -997,10 +1002,10 @@ def admin_login(h):
         time.sleep(1)
         admin_html(h, ADMIN_LOGIN.format(
             message='<p class="msg err">Wrong user or password, or not an admin.</p>',
-            action=html.escape(h._url('/admin/login'))), 403)
+            action=html.escape(h._admin_url('/login'))), 403)
         return
     sid = h.server.new_admin_session(user)
-    h._send(303, b'', 'text/plain', {'Location': h._url('/admin'),
+    h._send(303, b'', 'text/plain', {'Location': h._admin_url(),
                                      **admin_cookie(h, sid, ADMIN_SESSION_TTL)})
 
 
@@ -1016,7 +1021,7 @@ def admin_users(h):
         if action == 'logout':
             h.server.admin_sessions = {k: v for k, v in h.server.admin_sessions.items()
                                        if v[0] != h.admin}
-            h._send(303, b'', 'text/plain', {'Location': h._url('/admin'),
+            h._send(303, b'', 'text/plain', {'Location': h._admin_url(),
                                              **admin_cookie(h, '', 0)})
             return
         if action == 'add':
@@ -1037,9 +1042,11 @@ def admin_users(h):
             message = 'Deleted %s (books and reading data kept).' % name
         else:
             raise UserError('unknown action')
-        h._redirect('/admin?msg=' + urllib.parse.quote(message))
+        h._send(303, b'', 'text/plain',
+                {'Location': h._admin_url('?msg=' + urllib.parse.quote(message))})
     except UserError as exc:
-        h._redirect('/admin?err=1&msg=' + urllib.parse.quote(str(exc)))
+        h._send(303, b'', 'text/plain',
+                {'Location': h._admin_url('?err=1&msg=' + urllib.parse.quote(str(exc)))})
 
 
 # ---- reading progress -----------------------------------------------------------------------
@@ -1238,6 +1245,9 @@ def main(argv=None):
     cfg.public_base = cfg.public_url
     cfg.prefix = parts.path.rstrip('/')
     cfg.secure_cookies = parts.scheme == 'https'
+    # The admin page lives at the origin (https://host/admin), not under the API prefix: only the
+    # reader is bound to the 32-character URL, and it never uses the admin page.
+    cfg.origin = '%s://%s' % (parts.scheme, parts.netloc)
     Path(cfg.data).mkdir(parents=True, exist_ok=True)
     Path(cfg.library).mkdir(parents=True, exist_ok=True)
     cfg.log_file = str(Path(cfg.data) / 'requests.jsonl')

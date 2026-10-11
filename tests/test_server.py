@@ -509,13 +509,28 @@ class DeviceFlowTest(unittest.TestCase):
 
     # ---- admin page --------------------------------------------------------------------------
 
+    @property
+    def origin(self):
+        return self.base.rsplit('/', 1)[0]
+
+    def test_admin_page_lives_at_the_origin(self):
+        status, _, body = self.request('GET', self.origin + '/admin')
+        self.assertEqual(status, 200)
+        self.assertIn(('action="%s/admin/login"' % self.origin).encode(), body)
+        status, headers, _ = self.request('GET', '/admin')  # old address under the API prefix
+        self.assertEqual((status, headers['Location']), (301, self.origin + '/admin'))
+        _, headers, _ = self.request('POST', self.origin + '/admin/login',
+                                     form={'username': 'alice', 'password': PASSWORD})
+        self.assertIn('Path=/admin;', headers['Set-Cookie'])
+        self.assertEqual(headers['Location'], self.origin + '/admin')
+
     def admin_login(self, user='alice', password=PASSWORD):
-        status, headers, _ = self.request('POST', '/admin/login',
+        status, headers, _ = self.request('POST', self.origin + '/admin/login',
                                           form={'username': user, 'password': password})
         if status != 303:
             return status, None, None
         cookie = headers['Set-Cookie'].split(';')[0]
-        _, _, page = self.request('GET', '/admin', headers={'Cookie': cookie})
+        _, _, page = self.request('GET', self.origin + '/admin', headers={'Cookie': cookie})
         csrf = page.decode().split('name=csrf value="')[1].split('"')[0]
         return status, cookie, csrf
 
@@ -529,7 +544,7 @@ class DeviceFlowTest(unittest.TestCase):
         self.assertTrue(cookie.startswith('onilot_admin='))
 
     def test_admin_cookie_flags(self):
-        status, headers, _ = self.request('POST', '/admin/login',
+        status, headers, _ = self.request('POST', self.origin + '/admin/login',
                                           form={'username': 'alice', 'password': PASSWORD})
         flags = headers['Set-Cookie']
         self.assertIn('HttpOnly', flags)
@@ -537,11 +552,11 @@ class DeviceFlowTest(unittest.TestCase):
 
     def test_admin_actions_need_session_and_csrf(self):
         form = {'action': 'add', 'name': 'mallory', 'password': 'mallory-pw'}
-        status, headers, _ = self.request('POST', '/admin/users', form=form)
+        status, headers, _ = self.request('POST', self.origin + '/admin/users', form=form)
         self.assertEqual(status, 303)  # redirected to the login page
         self.assertNotIn('mallory', user_cli(self.data, 'list').stdout)
         _, cookie, csrf = self.admin_login()
-        status, _, _ = self.request('POST', '/admin/users', form={**form, 'csrf': 'bad'},
+        status, _, _ = self.request('POST', self.origin + '/admin/users', form={**form, 'csrf': 'bad'},
                                     headers={'Cookie': cookie})
         self.assertEqual(status, 403)
         self.assertNotIn('mallory', user_cli(self.data, 'list').stdout)
@@ -549,30 +564,30 @@ class DeviceFlowTest(unittest.TestCase):
     def test_admin_add_reset_and_delete_user(self):
         _, cookie, csrf = self.admin_login()
         h = {'Cookie': cookie}
-        self.request('POST', '/admin/users', headers=h, form={
+        self.request('POST', self.origin + '/admin/users', headers=h, form={
             'csrf': csrf, 'action': 'add', 'name': 'carol', 'password': 'carol-pass'})
         carol, _ = self.login('carol', 'carol-pass')
-        self.request('POST', '/admin/users', headers=h, form={
+        self.request('POST', self.origin + '/admin/users', headers=h, form={
             'csrf': csrf, 'action': 'passwd', 'name': 'carol', 'password': 'carol-new-pass'})
         # password change signs carol's readers out
         self.assertEqual(self.request('GET', '/v8/inventory',
                                       headers=self.auth(carol['access_token']))[0], 401)
         self.login('carol', 'carol-new-pass')
-        status, headers, _ = self.request('POST', '/admin/users', headers=h, form={
+        status, headers, _ = self.request('POST', self.origin + '/admin/users', headers=h, form={
             'csrf': csrf, 'action': 'remove', 'name': 'carol'})
         self.assertIn('Deleted', urllib.parse.unquote(headers['Location']))
         status, _, body = self.request('POST', '/oauth/authorize',
                                        form={'username': 'carol', 'password': 'carol-new-pass'})
         self.assertIn(b'Wrong user or password', body)
         # an admin cannot delete themselves
-        _, headers, _ = self.request('POST', '/admin/users', headers=h, form={
+        _, headers, _ = self.request('POST', self.origin + '/admin/users', headers=h, form={
             'csrf': csrf, 'action': 'remove', 'name': 'alice'})
         self.assertIn('err=1', headers['Location'])
 
     def test_admin_rejects_bad_user_names(self):
         _, cookie, csrf = self.admin_login()
         for name in ('../etc', 'shared', 'with space', 'a/b', ''):
-            _, headers, _ = self.request('POST', '/admin/users', headers={'Cookie': cookie},
+            _, headers, _ = self.request('POST', self.origin + '/admin/users', headers={'Cookie': cookie},
                                          form={'csrf': csrf, 'action': 'add', 'name': name,
                                                'password': 'long-enough'})
             self.assertIn('err=1', headers['Location'], name)

@@ -144,7 +144,7 @@ docker exec -it onilot python -m onilot user passwd bob
 docker exec onilot python -m onilot user remove bob             # books and progress are kept
 ```
 
-or in the browser at `ONILOT_PUBLIC_URL/admin` (admins only): add users, set passwords,
+or in the browser at `https://<your host>/admin` (admins only): add users, set passwords,
 grant admin, delete. Changing a password signs that user's readers out.
 
 Each user has their own books, reading progress, collections and list of readers; "sign out"
