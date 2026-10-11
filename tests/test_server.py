@@ -758,6 +758,21 @@ class DeviceFlowTest(unittest.TestCase):
         self.assertEqual([p['value']['name'] for p in self.tag_patches(self.sync(token, '0', []))],
                          ['Arc'])
 
+    def test_admin_shows_books_marked_finished(self):
+        token, books = self.new_user('fin', [('Done Book', '', '')])
+        self.sync(token, '0', [{'op': 'add', 'path': '/publications/%s/tags' % books['Done Book'],
+                                'value': {'name': 'collection_finished_readings_name',
+                                          'category': 'system', 'modified': 5,
+                                          'transientId': 3}}])
+        _, cookie, _ = self.admin_login()
+        _, _, page = self.request('GET', self.origin + '/admin/users/fin',
+                                  headers={'Cookie': cookie})
+        self.assertIn(b'width:100%', page)
+        self.assertIn(b'>finished<', page)
+        _, _, page = self.request('GET', self.origin + '/admin/users/fin/collections',
+                                  headers={'Cookie': cookie})
+        self.assertNotIn(b'collection_finished_readings_name', page)  # not a user collection
+
     def test_admin_collections_reject_bad_input(self):
         token, books = self.new_user('vic', [('Gamma', '', '')])
         _, cookie, csrf = self.admin_login()

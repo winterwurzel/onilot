@@ -60,6 +60,8 @@ ADMIN_SESSION_TTL = 8 * 3600
 CODE_TTL = 300
 MAX_BODY = 256 * 1024 * 1024  # largest accepted request (EPUB uploads)
 COLLECTIONS = ('tags', 'comments', 'dogears')
+# "Mark as finished" on the reader adds this tag (category "system") to the book.
+FINISHED_TAG = 'collection_finished_readings_name'
 COUNTRY_NAMES = {'DE': 'Deutschland', 'AT': 'Österreich', 'CH': 'Schweiz'}
 
 
@@ -340,6 +342,14 @@ class State:
                         and value.get('category') == 'collection' and value.get('name')):
                     result.setdefault(value['name'], []).append((key, parts[2]))
         return result
+
+    def finished(self):
+        """uuids of books marked as finished on a reader (a system tag, not the progress)."""
+        with self.lock:
+            return {key.split('/')[2] for key, doc in self.docs.items()
+                    if '/tags/' in key and not doc.get('deleted')
+                    and (doc.get('value') or {}).get('category') == 'system'
+                    and doc['value'].get('name') == FINISHED_TAG}
 
     def auto_collections(self):
         """Names of live collections created from series metadata."""

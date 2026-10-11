@@ -402,18 +402,22 @@ def admin_user(h, name):
     ctx, own, last = user_summary(h, name)
     is_admin = h.server.users.is_admin(name)
     progress = progress_by_uuid(ctx)
+    finished = ctx.state.finished()
     books = sorted(ctx.library.books(), key=lambda b: -progress.get(b['uuid'], (0, 0))[1])
     rows = []
     for b in books:
         pct, when = progress.get(b['uuid'], (0, 0))
+        if b['uuid'] in finished:
+            pct = 1.0
         rows.append('<tr><td><b>%s</b><div class="muted small">%s</div></td><td>%s</td>'
                     '<td><div class="row"><div class="progress"><i style="width:%d%%"></i></div>'
-                    '<span class="small">%d%%</span></div></td><td class="muted hide-sm">%s</td>'
+                    '<span class="small">%s</span></div></td><td class="muted hide-sm">%s</td>'
                     '</tr>' % (esc(b['title']), esc(', '.join(
                         b['authors'] + ([series_label(b)] if b['series'] else []))),
                                '<span class="badge ok">shared</span>' if b['shared'] else
                                ('<span class="badge">uploaded</span>' if ctx.is_upload(b) else ''),
-                               round(pct * 100), round(pct * 100),
+                               round(pct * 100),
+                               'finished' if b['uuid'] in finished else '%d%%' % round(pct * 100),
                                ago(when) if when else '–'))
     devices = ''.join(
         '<tr><td><b>%s</b> <span class="muted">%s</span><div class="muted small">%s</div></td>'
