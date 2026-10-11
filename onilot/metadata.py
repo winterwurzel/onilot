@@ -238,6 +238,13 @@ class SeriesStore:
         self.lock = threading.Lock()
         self.entries = json.loads(self.path.read_text()) if self.path.exists() else {}
 
+    def modified(self):
+        """When series data last changed (ms), so readers re-read the library."""
+        try:
+            return int(self.path.stat().st_mtime * 1000)
+        except FileNotFoundError:
+            return 0
+
     def get(self, key):
         with self.lock:
             entry = self.entries.get(key)

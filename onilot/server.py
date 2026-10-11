@@ -850,7 +850,28 @@ def device_user_id(h, hardware_id):
 
 # ---- library -------------------------------------------------------------------------------
 
-def content_item(h, book):
+def added_dates(books):
+    """uuid -> the "purchasedDate" sent to the reader, which stores it as the book's date added.
+
+    The reader cannot sort by series, but it can sort by date added (newest first). So each
+    series gets the date of its newest file, minus the book's position in seconds: sorted by
+    date added, a series stays together and in reading order (#1 first).
+    """
+    newest = {}
+    for b in books:
+        if b['series']:
+            newest[b['series']] = max(newest.get(b['series'], 0), b['mtime'])
+    dates = {}
+    for b in books:
+        if b['series']:
+            position = b['series_index'] if b['series_index'] is not None else 1000
+            dates[b['uuid']] = newest[b['series']] - round(position * 1000)
+        else:
+            dates[b['uuid']] = b['mtime']
+    return dates
+
+
+def content_item(h, book, added):
     return {
         'uuid': book['uuid'],
         'publicationId': book['uuid'],
@@ -864,7 +885,7 @@ def content_item(h, book):
         'contentIsPreview': False,
         'language': book['language'],
         'publisher': book['publisher'],
-        'purchasedDate': book['mtime'],
+        'purchasedDate': added,
         'resellerId': RESELLER_ID,
         'resellerName': h.server.cfg.brand,
         'authors': [{'name': a, 'type': 'AUTHOR'} for a in book['authors']],
@@ -880,11 +901,12 @@ def inventory(h):
     size = int(h.query.get('size', ['100'])[0])
     page = int(h.query.get('page', ['0'])[0])
     chunk = books[page * size:(page + 1) * size]
+    dates = added_dates(books)
     deleted = h.server.deletions_for(h.user)
     present = {b['uuid'] for b in books}
     deleted = {u: ts for u, ts in deleted.items() if u not in present}
     last_modified = max([b['mtime'] for b in books] + list(deleted.values())
-                        + list(h.ctx.shelf.values()) or [0])
+                        + list(h.ctx.shelf.values()) + [h.server.series.modified()] or [0])
     # The device sends back lastModifiedDate as If-Modified-Since. Answering 200 every time
     # makes it re-import every book, which resets read status and position (seen on device).
     since = h.headers.get('If-Modified-Since')
@@ -897,7 +919,7 @@ def inventory(h):
             h._send(304, b'', 'application/json; charset=UTF-8')
             return
     h._send_json({
-        'page': {'content': [content_item(h, b) for b in chunk],
+        'page': {'content': [content_item(h, b, dates[b['uuid']]) for b in chunk],
                  'numberOfElements': len(chunk), 'totalElements': len(books),
                  'number': page, 'size': size},
         # Books deleted on the server; the reader removes them from its library.
@@ -979,6 +1001,11 @@ nav { display:none; flex:none; border-top:2px solid #000; padding:.5em .8em;
 .paged nav { display:flex; }
 nav button { flex:1; padding:.6em; font-size:1.1em; font-weight:700; }
 nav span { min-width:7em; text-align:center; }
+a { color:#000; }
+.tabs { display:flex; gap:.4em; } .tabs a { padding:.25em .7em; border:2px solid #000;
+  border-radius:99px; text-decoration:none; } .tabs a.on { background:#000; color:#fff; }
+.heading { display:flex; align-items:center; gap:.8em; margin:.6em .8em 0; flex:none; }
+.heading h2 { font-size:1.15em; margin:0; flex:1; }
 """
 
 STORE_JS = """
@@ -1021,46 +1048,94 @@ def series_label(book):
     return '%s #%s' % (book['series'], ('%g' % index))
 
 
-def store_page(h, books, query, focus):
+STORE_VIEWS = (('', 'Books'), ('series', 'Series'))
+
+
+def store_state(source):
+    """The store page a request came from or goes back to: query, view, series."""
+    def get(key):
+        value = source.get(key, '')
+        return value[0] if isinstance(value, list) else value
+    return {k: get(k).strip()[:200] for k in ('q', 'view', 'series')}
+
+
+def store_token(h):
+    return next((v for k, v in h.headers.items() if k.lower() == 'x-access-token'), '')
+
+
+def store_form(h, path, state, label, css=''):
+    hidden = ''.join('<input type=hidden name=%s value="%s">' % (k, html.escape(v))
+                     for k, v in state.items() if v)
+    return ('<form method=post action="%s"><input type=hidden name=t value="%s">%s'
+            '<button class="%s">%s</button></form>' % (
+                html.escape(h._url(path)), html.escape(store_token(h)), hidden, css, label))
+
+
+def store_cover(h, book):
+    if h.user:
+        return '<img src="%s" alt="">' % html.escape(h._signed_url('covers', book['uuid']))
+    return '<span class="ph">%s</span>' % html.escape(book['title'][:1])
+
+
+def book_card(h, b, state, focus):
+    action = ''
+    if h.user:
+        owned = b['uuid'] in h.ctx.shelf
+        action = store_form(h, '/shop/%s/%s' % ('remove' if owned else 'add', b['uuid']), state,
+                            'Remove' if owned else 'Add', '' if owned else 'add')
+        if owned:
+            action = action.replace('<button', '<span class="owned">In your library</span>'
+                                    '<button', 1)
+    series = series_label(b)
+    if series and not state['series']:
+        series = '<a href="%s">%s</a>' % (html.escape(h._url('/shop?' + urllib.parse.urlencode(
+            {'series': b['series']}))), html.escape(series))
+    else:
+        series = html.escape(series)
+    return ('<div class="book"%s>%s<div><h2>%s</h2><p class="by">%s</p>%s%s</div></div>' % (
+        ' id="focus"' if b['uuid'] == focus else '', store_cover(h, b), html.escape(b['title']),
+        html.escape(', '.join(b['authors'])),
+        '<p class="series">%s</p>' % series if series else '', action))
+
+
+def series_card(h, name, books):
+    owned = sum(1 for b in books if h.user and b['uuid'] in h.ctx.shelf)
+    link = html.escape(h._url('/shop?' + urllib.parse.urlencode({'series': name})))
+    authors = sorted({a for b in books for a in b['authors']})
+    return ('<div class="book">%s<div><h2><a href="%s">%s</a></h2><p class="by">%s</p>'
+            '<p class="series">%d book%s%s</p><form method=get action="%s">'
+            '<input type=hidden name=series value="%s"><button>Open</button></form></div></div>'
+            % (store_cover(h, books[0]), link, html.escape(name),
+               html.escape(', '.join(authors)), len(books), '' if len(books) == 1 else 's',
+               ', %d in your library' % owned if owned else '', html.escape(h._url('/shop')),
+               html.escape(name)))
+
+
+def store_page(h, cards, state, title=None, actions=''):
     brand = html.escape(h.server.cfg.brand)
-    token = next((v for k, v in h.headers.items() if k.lower() == 'x-access-token'), '')
-    rows = []
-    for b in books:
-        owned = h.user and b['uuid'] in h.ctx.shelf
-        cover = ('<img src="%s" alt="">' % html.escape(h._signed_url('covers', b['uuid']))
-                 if h.user else
-                 '<span class="ph">%s</span>' % html.escape(b['title'][:1]))
-        if not h.user:
-            action = ''
-        else:
-            verb = 'remove' if owned else 'add'
-            action = ('<form method=post action="%s"><input type=hidden name=t value="%s">'
-                      '<input type=hidden name=q value="%s">%s<button class="%s">%s</button>'
-                      '</form>' % (html.escape(h._url('/shop/%s/%s' % (verb, b['uuid']))),
-                                   html.escape(token), html.escape(query),
-                                   '<span class="owned">In your library</span>' if owned else '',
-                                   '' if owned else 'add',
-                                   'Remove' if owned else 'Add'))
-        series = series_label(b)
-        rows.append('<div class="book"%s>%s<div><h2>%s</h2><p class="by">%s</p>%s%s</div></div>' % (
-            ' id="focus"' if b['uuid'] == focus else '', cover, html.escape(b['title']),
-            html.escape(', '.join(b['authors'])),
-            '<p class="series">%s</p>' % html.escape(series) if series else '', action))
+    tabs = ''.join('<a href="%s"%s>%s</a>' % (
+        html.escape(h._url('/shop' + ('?view=' + view if view else ''))),
+        ' class="on"' if view == state['view'] and not state['series'] else '', label)
+        for view, label in STORE_VIEWS)
     message = h.query.get('msg', [''])[0]
     notes = ('<div class="note">%s</div>' % html.escape(message)) if message else ''
     if not h.user:
         notes += '<div class="note">Open the store on your reader to add books.</div>'
+    if title:
+        notes += '<div class="heading"><h2>%s</h2>%s</div>' % (html.escape(title), actions)
     doc = """<!doctype html><html><head><meta charset="utf-8">
 <meta name=viewport content="width=device-width"><title>{brand}</title><style>{css}</style>
-</head><body><header><h1>{brand} store</h1><form class="search" action="{action}">
+</head><body><header><h1>{brand} store</h1><div class="tabs">{tabs}</div>
+<form class="search" action="{action}"><input type=hidden name=view value="{view}">
 <input type=search name=q value="{q}" placeholder="Title, author, series"><button>Search</button>
-</form></header>{notes}<main>{rows}</main>
+</form></header>{notes}<main>{cards}</main>
 <nav><button id="prev">&lsaquo; Previous</button><span id="pageno"></span>
 <button id="next">Next &rsaquo;</button></nav>
 <script>{js}</script>
-</body></html>""".format(brand=brand, css=STORE_CSS, js=STORE_JS,
-                         action=html.escape(h._url('/shop')), q=html.escape(query), notes=notes,
-                         rows=''.join(rows) or '<div class="empty">No books found.</div>')
+</body></html>""".format(brand=brand, css=STORE_CSS, js=STORE_JS, tabs=tabs,
+                         action=html.escape(h._url('/shop')), q=html.escape(state['q']),
+                         view=html.escape(state['view']), notes=notes,
+                         cards=''.join(cards) or '<div class="empty">Nothing found.</div>')
     h._send(200, doc.encode(), 'text/html; charset=UTF-8')
 
 
@@ -1083,40 +1158,90 @@ def store_order(books):
     return sorted(books, key=key)
 
 
+def matches(book, needle):
+    return (not needle or needle in book['title'].lower()
+            or any(needle in a.lower() for a in book['authors'])
+            or needle in (book['series'] or '').lower())
+
+
 @route('GET', r'/shop(?:https?://.*)?')
 def shop(h):
-    query = h.query.get('q', [''])[0].strip()
+    state = store_state(h.query)
     focus = h.query.get('id', [''])[0]
-    needle = query.lower()
-    books = [b for b in store_order(h.server.shared_library().books())
-             if not needle or needle in b['title'].lower()
-             or any(needle in a.lower() for a in b['authors'])
-             or needle in (b['series'] or '').lower()]
-    store_page(h, books, query, focus)
+    needle = state['q'].lower()
+    books = [b for b in store_order(h.server.shared_library().books()) if matches(b, needle)]
+    if state['series']:
+        books = sorted((b for b in books if b['series'] == state['series']),
+                       key=lambda b: (b['series_index'] is None, b['series_index'] or 0,
+                                      b['title'].lower()))
+        missing = [b for b in books if h.user and b['uuid'] not in h.ctx.shelf]
+        actions = store_form(h, '/shop/add-series', state, 'Add all %d' % len(missing),
+                             'add') if missing else ''
+        store_page(h, [book_card(h, b, state, focus) for b in books], state,
+                   title=state['series'], actions=actions)
+    elif state['view'] == 'series':
+        groups = {}
+        for b in books:
+            if b['series']:
+                groups.setdefault(b['series'], []).append(b)
+        cards = [series_card(h, name, sorted(group, key=lambda b: b['series_index'] or 0))
+                 for name, group in sorted(groups.items(), key=lambda kv: kv[0].lower())]
+        store_page(h, cards, state)
+    else:
+        store_page(h, [book_card(h, b, state, focus) for b in books], state)
+
+
+def store_user(h, form):
+    # The token arrives as a header on the reader; the form copy is a fallback in case the
+    # webview does not add it to form posts.
+    user = h.user or h.server.access_user(form.get('t', ''))
+    if user:
+        h.user = user
+    return user
+
+
+def back_to_store(h, form, message, uuid=''):
+    state = {k: v for k, v in store_state(form).items() if v}
+    state.update({'msg': message, **({'id': uuid} if uuid else {})})
+    h._send(303, b'', 'text/plain', {'Location': h._url('/shop?' + urllib.parse.urlencode(state))})
+
+
+SYNC_HINT = 'after the next sync (Settings > account > Link Library > Sync now)'
 
 
 @route('POST', r'/shop/(add|remove)/([0-9a-f]{40})')
 def shop_action(h, verb, uuid):
     form = h._form()
-    # The token arrives as a header on the reader; the form copy is a fallback in case the
-    # webview does not add it to form posts.
-    user = h.user or h.server.access_user(form.get('t', ''))
-    if not user:
+    if not store_user(h, form):
         h._send_json({'error': 'unauthorized'}, 401)
         return
-    h.user = user
     book = h.server.shared_library().find(uuid)
     if book is None:
         message = 'That book is no longer in the store.'
     elif verb == 'add':
         h.ctx.add_to_shelf(uuid)
-        message = ('Added "%s". It appears in your library after the next sync '
-                   '(Settings > account > Link Library > Sync now).' % book['title'])
+        message = 'Added "%s". It appears in your library %s.' % (book['title'], SYNC_HINT)
     else:
         h.ctx.remove_from_shelf(uuid)
         message = 'Removed "%s"; it leaves your reader at the next sync.' % book['title']
-    query = urllib.parse.urlencode({'q': form.get('q', ''), 'id': uuid, 'msg': message})
-    h._send(303, b'', 'text/plain', {'Location': h._url('/shop?' + query)})
+    back_to_store(h, form, message, uuid)
+
+
+@route('POST', r'/shop/add-series')
+def shop_add_series(h):
+    form = h._form()
+    if not store_user(h, form):
+        h._send_json({'error': 'unauthorized'}, 401)
+        return
+    name = form.get('series', '')
+    books = [b for b in h.server.shared_library().books()
+             if b['series'] == name and b['uuid'] not in h.ctx.shelf]
+    for b in books:
+        h.ctx.add_to_shelf(b['uuid'])
+    message = ('Added %d books of %s. They appear in your library %s.' % (len(books), name,
+                                                                          SYNC_HINT)
+               if books else 'You already have every book of %s.' % name)
+    back_to_store(h, form, message)
 
 
 # ---- uploads of sideloaded books (device pushes them automatically) ----------------------

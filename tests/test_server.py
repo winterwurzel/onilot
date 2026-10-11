@@ -822,6 +822,46 @@ class DeviceFlowTest(unittest.TestCase):
         self.assertNotIn('collections', headers.get('Location', ''))  # no session: login page
         self.assertEqual(self.tag_patches(self.sync(token, '0', [])), [])
 
+    def test_store_series_view_and_add_whole_series(self):
+        names = ['epic%d.epub' % i for i in (1, 2, 3)]
+        for i, name in enumerate(names, 1):
+            make_series_epub(self.lib / 'shared' / name, 'Epic Part %d' % i, 'Epic Cycle', str(i))
+        self.addCleanup(lambda: [(self.lib / 'shared' / n).unlink() for n in names])
+        token, _ = self.new_user('sam')
+        h = {'X-Access-Token': token}
+        _, _, page = self.request('GET', '/shop?view=series', headers=h)
+        self.assertIn(b'Epic Cycle', page)
+        self.assertIn(b'3 books', page)
+        self.assertNotIn(b'Shared Book', page)          # no series: not in the series view
+        _, _, page = self.request('GET', '/shop?series=Epic+Cycle', headers=h)
+        self.assertLess(page.index(b'Epic Part 1'), page.index(b'Epic Part 3'))
+        self.assertIn(b'Add all 3', page)
+        self.assertEqual(self.request('POST', '/shop/add-series',
+                                      form={'series': 'Epic Cycle'})[0], 401)
+        status, headers, _ = self.request('POST', '/shop/add-series', headers=h,
+                                          form={'series': 'Epic Cycle'})
+        self.assertEqual(status, 303)
+        self.assertIn('series=Epic+Cycle', headers['Location'])
+        self.assertIn('Added 3 books', urllib.parse.unquote_plus(headers['Location']))
+        items = self.inventory_titles(token)
+        self.assertTrue({'Epic Part 1', 'Epic Part 2', 'Epic Part 3'} <= set(items))
+        # the reader sorts by date added, newest first: the series in reading order
+        dates = [items['Epic Part %d' % i]['purchasedDate'] for i in (1, 2, 3)]
+        self.assertEqual(dates, sorted(dates, reverse=True))
+        _, _, page = self.request('GET', '/shop?series=Epic+Cycle', headers=h)
+        self.assertNotIn(b'Add all', page)
+
+    def test_series_change_makes_the_reader_reload_the_library(self):
+        token, _ = self.new_user('rel', [('Reload Me', '', '')])
+        _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
+        before = json.loads(body)['lastModifiedDate']
+        time.sleep(0.02)
+        _, cookie, csrf = self.admin_login()
+        self.request('POST', self.origin + '/admin/series', headers={'Cookie': cookie}, form={
+            'csrf': csrf, 'action': 'set', 'key': 'reload me|jane author', 'series': 'Now'})
+        _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
+        self.assertGreater(json.loads(body)['lastModifiedDate'], before)
+
     def test_store_pages_and_finds_series(self):
         make_series_epub(self.lib / 'shared' / 'tale1.epub', 'Tale Begins', 'Long Tale', '1')
         make_series_epub(self.lib / 'shared' / 'tale2.epub', 'Tale Ends', 'Long Tale', '2')

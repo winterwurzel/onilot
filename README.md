@@ -189,6 +189,11 @@ review**. Wikidata knows well-known series; niche books often have no entry. Set
 
 A series collection you delete or rename on the reader stays that way.
 
+The reader has no series sort, but it sorts by **Date added**, and that date comes from the
+server. onilot gives the books of a series consecutive dates in reading order, so
+**My Books > Sort: Date added** (or the series' collection sorted that way) lists each series
+together, #1 first. The store has a **Series** tab and can add a whole series at once.
+
 ## On the reader
 
 - **Settings > account > Link Library** shows your books and has a **Sync now** button.
