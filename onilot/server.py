@@ -57,6 +57,7 @@ COVER_NEVER_EXPIRES = 4102444800  # 2100-01-01; covers are low-sensitivity
 ACCESS_TOKEN_TTL = 3600
 ADMIN_SESSION_TTL = 8 * 3600
 CODE_TTL = 300
+MAX_BODY = 256 * 1024 * 1024  # largest accepted request (EPUB uploads)
 COLLECTIONS = ('tags', 'comments', 'dogears')
 COUNTRY_NAMES = {'DE': 'Deutschland', 'AT': 'Österreich', 'CH': 'Schweiz'}
 
@@ -324,7 +325,16 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith(cfg.prefix):
             path = path[len(cfg.prefix):] or '/'
         self.query = urllib.parse.parse_qs(parsed.query)
-        length = int(self.headers.get('Content-Length') or 0)
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_BODY:
+            self.query, self.body, self.response_log = {}, b'', None
+            self._send_json({'error': 'request too large (limit %d MB)' % (MAX_BODY >> 20)}, 413)
+            self.close_connection = True
+            self._log(path)
+            return
         self.body = self.rfile.read(length) if length else b''
         self.response_log = None
         self.user = self._token_user()
@@ -630,7 +640,10 @@ def inventory(h):
     size = int(h.query.get('size', ['100'])[0])
     page = int(h.query.get('page', ['0'])[0])
     chunk = books[page * size:(page + 1) * size]
-    last_modified = max((b['mtime'] for b in books), default=0)
+    deleted = h.server.deletions_for(h.user)
+    present = {b['uuid'] for b in books}
+    deleted = {u: ts for u, ts in deleted.items() if u not in present}
+    last_modified = max([b['mtime'] for b in books] + list(deleted.values()) or [0])
     # The device sends back lastModifiedDate as If-Modified-Since. Answering 200 every time
     # makes it re-import every book, which resets read status and position (seen on device).
     since = h.headers.get('If-Modified-Since')
@@ -646,7 +659,8 @@ def inventory(h):
         'page': {'content': [content_item(h, b) for b in chunk],
                  'numberOfElements': len(chunk), 'totalElements': len(books),
                  'number': page, 'size': size},
-        'deletedContent': [],
+        # Books deleted on the server; the reader removes them from its library.
+        'deletedContent': [{'uuid': u} for u in sorted(deleted)] if page == 0 else [],
         'lastModifiedDate': last_modified,
     })
 
@@ -903,152 +917,6 @@ def api_sign_out(h):
     h._send_json({'signed_out': True})
 
 
-# ---- admin page (browser) ---------------------------------------------------------------------
-#
-# Session cookie (HttpOnly, SameSite=Strict, Secure on https) for admin users, plus a CSRF token
-# in every form.
-
-ADMIN_PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<meta name=viewport content="width=device-width"><title>{brand} admin</title>
-<style>
-body {{ font-family: sans-serif; max-width: 52em; margin: 2em auto; padding: 0 1em; }}
-table {{ border-collapse: collapse; width: 100%; }}
-td, th {{ text-align: left; padding: .4em; border-bottom: 1px solid #ddd; vertical-align: top; }}
-input, button {{ font-size: 1em; }} form.inline {{ display: inline; }}
-.msg {{ padding: .6em; background: #eef; }} .err {{ background: #fee; }}
-</style></head><body><h1>{brand} admin</h1>{body}</body></html>"""
-
-ADMIN_LOGIN = """{message}<form method=post action="{action}">
-<p><label>User<br><input name=username autocapitalize=none required></label></p>
-<p><label>Password<br><input type=password name=password required></label></p>
-<p><button>Sign in</button></p></form>"""
-
-
-def admin_html(h, body, status=200, extra_headers=None):
-    h._html(ADMIN_PAGE.format(brand=html.escape(h.server.cfg.brand), body=body), status,
-            extra_headers)
-
-
-def admin_message(h):
-    text = h.query.get('msg', [''])[0]
-    css = 'msg err' if h.query.get('err') else 'msg'
-    return '<p class="%s">%s</p>' % (css, html.escape(text)) if text else ''
-
-
-def admin_cookie(h, sid, max_age):
-    flags = 'Path=/admin; HttpOnly; SameSite=Strict; Max-Age=%d' % max_age
-    if h.server.cfg.secure_cookies:
-        flags += '; Secure'
-    return {'Set-Cookie': 'onilot_admin=%s; %s' % (sid, flags)}
-
-
-@route('GET', r'/admin')
-def admin_index(h):
-    if urllib.parse.urlsplit(h.path).path != '/admin':  # reached as <prefix>/admin
-        h._send(301, b'', 'text/plain', {'Location': h._admin_url()})
-        return
-    if not h._admin_session():
-        admin_html(h, ADMIN_LOGIN.format(message=admin_message(h),
-                                         action=html.escape(h._admin_url('/login'))))
-        return
-    csrf = html.escape(h.csrf)
-
-    def form(action, fields, label, confirm=None):
-        onsubmit = ' onsubmit="return confirm(%s)"' % html.escape(json.dumps(confirm)) \
-            if confirm else ''
-        return ('<form class=inline method=post action="%s"%s>'
-                '<input type=hidden name=csrf value="%s">%s<button>%s</button></form> ' % (
-                    html.escape(h._admin_url('/users')), onsubmit, csrf,
-                    ''.join('<input type=hidden name="%s" value="%s">' % (k, html.escape(v))
-                            for k, v in fields.items()) + action, label))
-
-    rows = []
-    for name in h.server.users.names():
-        is_admin = h.server.users.is_admin(name)
-        ctx = h.server.context(name)
-        books = sum(1 for b in ctx.library.books() if not b['shared'])
-        actions = form('<input type=password name=password placeholder="new password" '
-                       'minlength=8 required>', {'action': 'passwd', 'name': name},
-                       'Set password')
-        actions += form('', {'action': 'admin', 'name': name,
-                             'state': 'off' if is_admin else 'on'},
-                        'Revoke admin' if is_admin else 'Make admin')
-        if name != h.admin:
-            actions += form('', {'action': 'remove', 'name': name}, 'Delete',
-                            'Delete account %s? Books and reading data are kept.' % name)
-        rows.append('<tr><td><b>%s</b>%s</td><td>%d own books, %d readers</td><td>%s</td></tr>'
-                    % (html.escape(name), ' (admin)' if is_admin else '', books,
-                       len(ctx.devices), actions))
-    body = (admin_message(h)
-            + '<p>Signed in as <b>%s</b>. ' % html.escape(h.admin)
-            + form('', {'action': 'logout'}, 'Sign out') + '</p>'
-            + '<h2>Users</h2><table><tr><th>User</th><th>Data</th><th></th></tr>%s</table>'
-            % ''.join(rows)
-            + '<h2>Add user</h2>'
-            + form('<input name=name placeholder="name" pattern="[a-z0-9][a-z0-9._-]{0,31}" '
-                   'required> <input type=password name=password placeholder="password" '
-                   'minlength=8 required> <label><input type=checkbox name=admin value=1> '
-                   'admin</label> ', {'action': 'add'}, 'Add')
-            + '<p>Books: put files into <code>library/&lt;user&gt;/</code> (private) or '
-              '<code>library/shared/</code> (everyone).</p>')
-    admin_html(h, body)
-
-
-@route('POST', r'/admin/login')
-def admin_login(h):
-    form = h._form()
-    user = h.server.users.authenticate(form.get('username'), form.get('password'))
-    if user is None or not h.server.users.is_admin(user):
-        time.sleep(1)
-        admin_html(h, ADMIN_LOGIN.format(
-            message='<p class="msg err">Wrong user or password, or not an admin.</p>',
-            action=html.escape(h._admin_url('/login'))), 403)
-        return
-    sid = h.server.new_admin_session(user)
-    h._send(303, b'', 'text/plain', {'Location': h._admin_url(),
-                                     **admin_cookie(h, sid, ADMIN_SESSION_TTL)})
-
-
-@route('POST', r'/admin/users', 'admin')
-def admin_users(h):
-    form = h._form()
-    if not hmac.compare_digest(form.get('csrf', ''), h.csrf):
-        admin_html(h, '<p class="msg err">Form expired, please reload.</p>', 403)
-        return
-    action, name = form.get('action'), (form.get('name') or '').strip().lower()
-    users = h.server.users
-    try:
-        if action == 'logout':
-            h.server.admin_sessions = {k: v for k, v in h.server.admin_sessions.items()
-                                       if v[0] != h.admin}
-            h._send(303, b'', 'text/plain', {'Location': h._admin_url(),
-                                             **admin_cookie(h, '', 0)})
-            return
-        if action == 'add':
-            users.add(name, form.get('password', ''), admin=form.get('admin') == '1')
-            message = 'Created %s.' % name
-        elif action == 'passwd':
-            users.set_password(name, form.get('password', ''))
-            h.server.sign_out(name)
-            message = 'New password set for %s; their readers must sign in again.' % name
-        elif action == 'admin':
-            users.set_admin(name, form.get('state') == 'on')
-            message = 'Updated %s.' % name
-        elif action == 'remove':
-            if name == h.admin:
-                raise UserError('you cannot delete yourself')
-            users.remove(name)
-            h.server.sign_out(name)
-            message = 'Deleted %s (books and reading data kept).' % name
-        else:
-            raise UserError('unknown action')
-        h._send(303, b'', 'text/plain',
-                {'Location': h._admin_url('?msg=' + urllib.parse.quote(message))})
-    except UserError as exc:
-        h._send(303, b'', 'text/plain',
-                {'Location': h._admin_url('?err=1&msg=' + urllib.parse.quote(str(exc)))})
-
-
 # ---- reading progress -----------------------------------------------------------------------
 
 @route('PATCH', r'/v4/reading-metadata', 'token')
@@ -1109,6 +977,10 @@ class Server(ThreadingHTTPServer):
         self.shared_dir.mkdir(parents=True, exist_ok=True)
         self.contexts = {}
         self.contexts_lock = threading.Lock()
+        self.deletions_path = Path(cfg.data) / 'deleted.json'
+        self.deletions = json.loads(self.deletions_path.read_text()) \
+            if self.deletions_path.exists() else {}   # owner -> {uuid: deleted at (ms)}
+        self.deletions_lock = threading.Lock()
         self.log_lock = threading.Lock()
         self.tokens_lock = threading.Lock()
         self.codes = {}            # code -> (user, expires)
@@ -1133,6 +1005,16 @@ class Server(ThreadingHTTPServer):
 
     def shared_library(self):
         return Library([(self.shared_dir, 'shared/', True)])
+
+    def record_deletion(self, owner, uuid):
+        with self.deletions_lock:
+            self.deletions.setdefault(owner, {})[uuid] = int(time.time() * 1000)
+            self.deletions_path.write_text(json.dumps(self.deletions, indent=1))
+
+    def deletions_for(self, user):
+        result = dict(self.deletions.get('shared', {}))
+        result.update(self.deletions.get(user, {}))
+        return result
 
     # ---- tokens ------------------------------------------------------------------------------
 
@@ -1281,6 +1163,9 @@ def entry(argv=None):
         user_cli(argv[1:])
     else:
         main(argv)
+
+
+from onilot import admin  # noqa: E402,F401  (registers the /admin routes)
 
 
 if __name__ == '__main__':

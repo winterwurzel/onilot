@@ -556,9 +556,11 @@ class DeviceFlowTest(unittest.TestCase):
         self.assertEqual(status, 303)  # redirected to the login page
         self.assertNotIn('mallory', user_cli(self.data, 'list').stdout)
         _, cookie, csrf = self.admin_login()
-        status, _, _ = self.request('POST', self.origin + '/admin/users', form={**form, 'csrf': 'bad'},
-                                    headers={'Cookie': cookie})
-        self.assertEqual(status, 403)
+        status, headers, _ = self.request('POST', self.origin + '/admin/users',
+                                          form={**form, 'csrf': 'bad'},
+                                          headers={'Cookie': cookie})
+        self.assertEqual(status, 303)
+        self.assertIn('err=1', headers['Location'])
         self.assertNotIn('mallory', user_cli(self.data, 'list').stdout)
 
     def test_admin_add_reset_and_delete_user(self):
@@ -567,22 +569,84 @@ class DeviceFlowTest(unittest.TestCase):
         self.request('POST', self.origin + '/admin/users', headers=h, form={
             'csrf': csrf, 'action': 'add', 'name': 'carol', 'password': 'carol-pass'})
         carol, _ = self.login('carol', 'carol-pass')
-        self.request('POST', self.origin + '/admin/users', headers=h, form={
-            'csrf': csrf, 'action': 'passwd', 'name': 'carol', 'password': 'carol-new-pass'})
+        self.request('POST', self.origin + '/admin/users/carol', headers=h, form={
+            'csrf': csrf, 'action': 'passwd', 'password': 'carol-new-pass'})
         # password change signs carol's readers out
         self.assertEqual(self.request('GET', '/v8/inventory',
                                       headers=self.auth(carol['access_token']))[0], 401)
         self.login('carol', 'carol-new-pass')
-        status, headers, _ = self.request('POST', self.origin + '/admin/users', headers=h, form={
-            'csrf': csrf, 'action': 'remove', 'name': 'carol'})
+        status, headers, _ = self.request('POST', self.origin + '/admin/users/carol', headers=h,
+                                          form={'csrf': csrf, 'action': 'delete'})
         self.assertIn('Deleted', urllib.parse.unquote(headers['Location']))
         status, _, body = self.request('POST', '/oauth/authorize',
                                        form={'username': 'carol', 'password': 'carol-new-pass'})
         self.assertIn(b'Wrong user or password', body)
         # an admin cannot delete themselves
-        _, headers, _ = self.request('POST', self.origin + '/admin/users', headers=h, form={
-            'csrf': csrf, 'action': 'remove', 'name': 'alice'})
+        _, headers, _ = self.request('POST', self.origin + '/admin/users/alice', headers=h,
+                                     form={'csrf': csrf, 'action': 'delete'})
         self.assertIn('err=1', headers['Location'])
+
+
+    def test_admin_user_page_shows_reading_progress(self):
+        alice, _ = self.login()
+        uuid = self.inventory_titles(alice['access_token'])['Test Book']['uuid']
+        self.sync(alice['access_token'], '0', [{'op': 'add',
+                  'path': '/publications/%s/bookmark' % uuid,
+                  'value': {'position': 'p', 'progress': 0.42, 'modified': 5, 'transientId': 9}}])
+        _, cookie, _ = self.admin_login()
+        status, _, body = self.request('GET', self.origin + '/admin/users/alice',
+                                       headers={'Cookie': cookie})
+        self.assertEqual(status, 200)
+        self.assertIn(b'Test Book', body)
+        self.assertIn(b'42%', body)
+
+    def test_admin_pages_and_covers_need_session(self):
+        for path in ('/admin/users/alice', '/admin/library?owner=shared',
+                     '/admin/cover/shared/' + '0' * 40):
+            status, headers, _ = self.request('GET', self.origin + path)
+            self.assertEqual(status, 303, path)
+            self.assertTrue(headers['Location'].endswith('/admin'), path)
+
+    def test_admin_upload_and_delete_shared_book_reaches_readers(self):
+        _, cookie, csrf = self.admin_login()
+        epub = Path(self.tmp.name, 'admin-up.epub')
+        make_epub(epub, 'Admin Upload')
+        boundary = 'b0undary'
+        body = (('--%s\r\nContent-Disposition: form-data; name="file"; filename="admin-up.epub"'
+                 '\r\nContent-Type: application/epub+zip\r\n\r\n' % boundary).encode()
+                + epub.read_bytes() + ('\r\n--%s--\r\n' % boundary).encode())
+        headers = {'Cookie': cookie, 'X-CSRF-Token': csrf,
+                   'Content-Type': 'multipart/form-data; boundary=%s' % boundary}
+        status, _, _ = self.request('POST', self.origin + '/admin/library/upload?owner=shared',
+                                    body=body, headers={**headers, 'X-CSRF-Token': 'bad'})
+        self.assertEqual(status, 403)
+        status, _, _ = self.request('POST', self.origin + '/admin/library/upload?owner=shared',
+                                    body=body, headers=headers)
+        self.assertEqual(status, 200)
+        bob, _ = self.login('bob', BOB_PASSWORD)
+        item = self.inventory_titles(bob['access_token'])['Admin Upload']
+        status, _, page = self.request('GET', self.origin + '/admin/library?owner=shared',
+                                       headers={'Cookie': cookie})
+        self.assertIn(b'Admin Upload', page)
+        status, _, _ = self.request('POST', self.origin + '/admin/library/shared/' + item['uuid'],
+                                    headers={'Cookie': cookie},
+                                    form={'csrf': csrf, 'action': 'delete'})
+        self.assertEqual(status, 303)
+        self.assertFalse((self.lib / 'shared' / 'admin-up.epub').exists())
+        _, _, inv = self.request('GET', '/v8/inventory', headers=self.auth(bob['access_token']))
+        inv = json.loads(inv)
+        self.assertIn({'uuid': item['uuid']}, inv['deletedContent'])
+        self.assertNotIn('Admin Upload', [i['title'] for i in inv['page']['content']])
+
+    def test_oversized_request_is_rejected_before_reading(self):
+        import http.client
+        host, port = urllib.parse.urlsplit(self.base).netloc.split(':')
+        conn = http.client.HTTPConnection(host, int(port), timeout=10)
+        conn.putrequest('POST', '/onilotapi/v1/inventory/user-uploads')
+        conn.putheader('Content-Length', str(10 * 1024 ** 3))
+        conn.endheaders()
+        self.assertEqual(conn.getresponse().status, 413)
+        conn.close()
 
     def test_admin_rejects_bad_user_names(self):
         _, cookie, csrf = self.admin_login()
