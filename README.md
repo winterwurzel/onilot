@@ -19,6 +19,8 @@ yourself instead of the vendor cloud.
 | Reading position sync, both directions, last write wins | ✓ |
 | Books copied to the reader over USB are uploaded to the server automatically | ✓ |
 | Home screen recommendations, shop tab (lists the server's books) | ✓ |
+| Collections sync | ✓ |
+| Settings > account: library page with **Sync now**, device list with sign-out | ✓ |
 | Adobe DRM / vendor DRM books, audiobooks, highlights/notes sync | ✗ |
 
 ## How it works

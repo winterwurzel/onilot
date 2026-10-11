@@ -341,6 +341,60 @@ class DeviceFlowTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b'<h1>onilot</h1>', body)
 
+    def test_tags_are_a_list_per_publication(self):
+        tokens, _ = self.login()
+        path = '/publications/tag-book/tags'
+        resp = self.sync(tokens['access_token'], '0', [
+            {'op': 'add', 'path': path, 'value': {'name': 'A', 'modified': 1, 'transientId': 1}},
+            {'op': 'add', 'path': path, 'value': {'name': 'B', 'modified': 1, 'transientId': 2}}])
+        echoes = [p for p in resp['patches'] if p['path'].startswith(path + '/')]
+        self.assertEqual(sorted(p['value']['transientId'] for p in echoes), ['1', '2'])
+        self.assertEqual(len({p['path'] for p in echoes}), 2)  # two separate documents
+        first = echoes[0]['path']
+        resp = self.sync(tokens['access_token'], resp['revision'],
+                         [{'op': 'remove', 'path': first}])
+        doc = json.loads(Path(self.tmp.name, 'data', 'reading-metadata.json').read_text())
+        self.assertTrue(doc['docs'][first]['deleted'])
+        self.assertEqual(sum(1 for k, v in doc['docs'].items()
+                             if k.startswith(path + '/') and not v['deleted']), 1)
+
+    def test_reseller_config_points_account_pages_at_server(self):
+        _, _, body = self.request('GET', '/v1/resellers/1/client-types/x/config')
+        config = json.loads(body)['config']
+        self.assertEqual(config['URL_HANDSHAKE'], self.base + '/manage/library')
+        self.assertEqual(config['URL_DEVICE_MANAGEMENT'], self.base + '/manage/devices')
+
+    def test_manage_pages_render_and_use_handshake_config(self):
+        for page in ('/manage/library', '/manage/devices?action=logindevicelimit&lang=de'):
+            status, _, body = self.request('GET', page)
+            self.assertEqual(status, 200)
+            self.assertIn(b'handshake_config', body)
+            self.assertIn(b'Bearer', body)
+
+    def test_manage_api_requires_token(self):
+        self.assertEqual(self.request('GET', '/onilot/library')[0], 401)
+        self.assertEqual(self.request('GET', '/onilot/devices')[0], 401)
+        self.assertEqual(self.request('POST', '/onilot/devices/sign-out', body=b'')[0], 401)
+
+    def test_devices_are_tracked_and_sign_out_revokes_tokens(self):
+        tokens, _ = self.login()
+        headers = {**self.auth(tokens['access_token']), 'Hardware-Id': 'hw-test-1',
+                   'client_type': 'TOLINO_VISION_7', 'client_version': '5.18.264769'}
+        self.request('GET', '/v8/inventory', headers=headers)
+        # a later request without client headers must not erase them
+        self.request('GET', '/v2/recommendations', headers={
+            **self.auth(tokens['access_token']), 'Hardware-Id': 'hw-test-1'})
+        status, _, body = self.request('GET', '/onilot/devices', headers=headers)
+        devices = {d['id']: d for d in json.loads(body)['devices']}
+        self.assertEqual(devices['hw-test-1']['client_type'], 'TOLINO_VISION_7')
+        _, _, body = self.request('GET', '/onilot/library', headers=headers)
+        self.assertIn('Test Book', [b['title'] for b in json.loads(body)['books']])
+        status, _, _ = self.request('POST', '/onilot/devices/sign-out', body=b'', headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.request('GET', '/v8/inventory', headers=headers)[0], 401)
+        form = {'refresh_token': tokens['refresh_token'], 'grant_type': 'refresh_token'}
+        self.assertEqual(self.request('POST', '/oauth/token', form=form)[0], 400)
+
     def test_log_contains_no_password_or_tokens(self):
         tokens, _ = self.login()
         log = Path(self.tmp.name, 'data', 'requests.jsonl').read_text()

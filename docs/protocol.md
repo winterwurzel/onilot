@@ -148,6 +148,22 @@ The reader pushes books copied over USB to the cloud automatically:
 `/v1/inventory/user-uploads/{uuid}/cover`, re-fetches the library, and moves the local
 reading position to the cloud copy as a bookmark `add`.
 
+## Account pages (Settings > account)
+
+"Link Library" opens `URL_HANDSHAKE` and "Device Management" opens `URL_DEVICE_MANAGEMENT`
+from the reseller config in a webview (the latter with `?action=logindevicelimit&lang=…#devices`
+appended). Without these keys the reader falls back to the vendor's management site. The
+reader injects into the page:
+
+```js
+window.handshake_config = { token: "<access token>", wdycf: "handshakeCancel",
+                            libjump: "handshakeFinish", deviceid: "<hardware id>" };
+```
+
+Navigating to any URL containing `handshakeFinish` closes the dialog and starts a sync;
+`handshakeCancel` only closes it (the request still reaches the server). onilot uses this
+for a library page with a "Sync now" button and a device list with "sign out all readers".
+
 ## Home screen recommendations
 
 `GET /v2/recommendations?count=12&context=homescreen&type=ebook` returns a top-level array

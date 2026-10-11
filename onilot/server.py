@@ -49,6 +49,7 @@ LOG_BODY_LIMIT = 64 * 1024
 SIGNED_URL_TTL = 24 * 3600
 COVER_NEVER_EXPIRES = 4102444800  # 2100-01-01; covers are low-sensitivity
 ACCESS_TOKEN_TTL = 3600
+COLLECTIONS = ('tags', 'comments', 'dogears')
 COUNTRY_NAMES = {'DE': 'Deutschland', 'AT': 'Österreich', 'CH': 'Schweiz'}
 
 
@@ -165,6 +166,9 @@ class State:
         self.next_id = int(data.get('next_id', 1))
         # base path (without id) -> {"id", "revision", "value", "deleted"}
         self.docs = dict(data.get('docs', {}))
+        for key in [k for k in self.docs if k.rpartition('/')[2] in COLLECTIONS]:
+            doc = self.docs.pop(key)  # early versions stored list items under the list path
+            self.docs['%s/%d' % (key, doc['id'])] = doc
         if 'documents' in data and not self.docs:  # migrate the first, id-less format
             for base, value in data['documents'].items():
                 value = dict(value or {})
@@ -177,19 +181,35 @@ class State:
         return doc
 
     @staticmethod
-    def base_path(path):
-        head, _, last = path.rpartition('/')
-        return head if last.isdigit() else path
+    def doc_key(path):
+        """Storage key for a patch path, or None for an add to a collection.
+
+        The bookmark exists once per publication: /publications/<uuid>/bookmark[/<id>] maps
+        to one key. tags, comments and dogears are lists: an add on .../tags creates a new
+        document stored under .../tags/<id>.
+        """
+        head, _, last = path.rstrip('/').rpartition('/')
+        if last.isdigit():
+            parent = head.rpartition('/')[2]
+            return path if parent in COLLECTIONS else head
+        return None if last in COLLECTIONS else path
+
+    @staticmethod
+    def full_path(key, doc):
+        return key if key.rpartition('/')[2].isdigit() else '%s/%d' % (key, doc['id'])
 
     def _apply(self, patch, echoes, touched):
         op, path, value = patch.get('op'), patch.get('path'), patch.get('value')
         if not path or op not in ('add', 'replace', 'remove'):
             print('warning: ignoring malformed patch %r' % (patch,))
             return False
-        base = self.base_path(path)
-        doc = self.docs.get(base)
-        touched.add(base)
+        base = self.doc_key(path)
+        if base is None and op != 'add':
+            print('warning: %s on a collection without id: %r' % (op, path))
+            return False
+        doc = self.docs.get(base) if base else None
         if op == 'remove':
+            touched.add(base)
             if doc is None or doc['deleted']:
                 return False
             self.revision += 1
@@ -202,13 +222,16 @@ class State:
             self.revision += 1
             doc = self._new_doc(value)
             doc['revision'] = self.revision
+            if base is None:  # add to a collection: the server id becomes part of the key
+                base = '%s/%d' % (path.rstrip('/'), doc['id'])
             self.docs[base] = doc
             changed = True
         elif doc['deleted'] or value.get('modified', 0) > doc['value'].get('modified', 0):
             self.revision += 1
             doc.update(value=value, revision=self.revision, deleted=False)
             changed = True
-        full = '%s/%d' % (base, doc['id'])
+        touched.add(base)
+        full = self.full_path(base, doc)
         if op == 'add' and transient is not None:
             # transientId must be a JSON string: a number is read as 0 by the reader, which
             # then stores the echo as a new bookmark instead of confirming its own.
@@ -248,7 +271,7 @@ class State:
             for base, doc in self.docs.items():
                 if base in touched or doc['revision'] <= client_revision:
                     continue
-                full = '%s/%d' % (base, doc['id'])
+                full = self.full_path(base, doc)
                 if doc['deleted']:
                     outgoing.append({'op': 'remove', 'path': full})
                 else:
@@ -277,6 +300,8 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length') or 0)
         self.body = self.rfile.read(length) if length else b''
         self.response_log = None
+        if self.headers.get('Hardware-Id') and self._has_access_token():
+            self.server.seen_device(self.headers)
         for method, pattern, func, guard in self.routes:
             m = pattern.fullmatch(path)
             if m and method == self.command:
@@ -424,6 +449,9 @@ def reseller_config(h, reseller_id, client_type):
             'OAUTH_CLIENT_ID': CLIENT_ID,
             'STRING_BRAND_NAME': h.server.cfg.brand,
             'URL_RESELLER_LOGO': base + '/static/logo.png',
+            # Settings > account: "Link Library" and "Device Management" webviews.
+            'URL_HANDSHAKE': base + '/manage/library',
+            'URL_DEVICE_MANAGEMENT': base + '/manage/devices',
             'SHOP_BASE': base + '/shop',
             'URL_SHOP_EBOOK_START_PAGE': base + '/shop',
             'URL_SHOP_EBOOK_SEARCH': base + '/shop?q=%s',
@@ -689,6 +717,118 @@ def recommendations(h):
     } for b in books])
 
 
+# ---- account pages (Settings > account) -----------------------------------------------------
+#
+# The reader opens URL_HANDSHAKE ("Link Library") and URL_DEVICE_MANAGEMENT ("Device
+# Management") in a webview and injects
+#   window.handshake_config = {token, wdycf: "handshakeCancel", libjump: "handshakeFinish",
+#                              deviceid}
+# Navigating to any URL containing "handshakeFinish" closes the dialog and starts a sync;
+# "handshakeCancel" just closes it. The pages call the JSON API below with the token.
+
+MANAGE_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name=viewport content="width=device-width"><title>{brand}</title>
+<style>
+body {{ font-family: sans-serif; font-size: 1.3em; margin: 1em; }}
+button {{ font-size: 1em; padding: .4em 1em; margin: .3em .3em .3em 0; }}
+li {{ margin: .4em 0; }} .muted {{ color: #555; font-size: .85em; }}
+</style></head><body>
+<h1>{title}</h1><div id="content"><p class="muted">Loading…</p></div>
+<p>{buttons}<button onclick="leave('handshakeCancel')">Close</button></p>
+<script>
+var cfg = window.handshake_config || {{}};
+var api = {api};
+function leave(what) {{ location.href = api + '/manage/' + (cfg[what === 'handshakeFinish'
+  ? 'libjump' : 'wdycf'] || what); }}
+function esc(t) {{ var d = document.createElement('div'); d.textContent = t; return d.innerHTML; }}
+function call(method, path) {{
+  return fetch(api + path, {{method: method, headers: {{'Authorization': 'Bearer ' + cfg.token}}}})
+    .then(function (r) {{ if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }});
+}}
+function fail(e) {{ document.getElementById('content').innerHTML =
+  '<p>Could not load (' + esc(e.message) + '). Open this page from the reader settings.</p>'; }}
+{script}
+</script></body></html>"""
+
+LIBRARY_SCRIPT = """
+call('GET', '/onilot/library').then(function (d) {
+  var items = d.books.map(function (b) {
+    return '<li>' + esc(b.title) + (b.authors ? ' <span class="muted">' + esc(b.authors) +
+      '</span>' : '') + (b.uploaded ? ' <span class="muted">(uploaded)</span>' : '') + '</li>';
+  }).join('');
+  document.getElementById('content').innerHTML = '<p>' + d.books.length +
+    ' books on this server. "Sync now" downloads new ones into your library.</p><ul>' +
+    items + '</ul>';
+}, fail);
+"""
+
+DEVICES_SCRIPT = """
+function fmt(t) { return new Date(t * 1000).toLocaleString(); }
+function load() {
+  call('GET', '/onilot/devices').then(function (d) {
+    var items = d.devices.map(function (x) {
+      return '<li>' + esc(x.client_type || 'unknown device') + ' ' + esc(x.client_version) +
+        (x.id === cfg.deviceid ? ' <b>(this reader)</b>' : '') +
+        '<br><span class="muted">' + esc(x.id) + ' · last seen ' + fmt(x.last_seen) +
+        '</span></li>';
+    }).join('');
+    document.getElementById('content').innerHTML = '<p>Readers signed in to this server:</p>' +
+      '<ul>' + items + '</ul>';
+  }, fail);
+}
+function signOut() {
+  if (!confirm('Sign out every reader? Each has to sign in again with the password.')) return;
+  call('POST', '/onilot/devices/sign-out').then(function () { leave('handshakeCancel'); }, fail);
+}
+load();
+"""
+
+
+def manage_page(h, title, script, buttons=''):
+    page = MANAGE_PAGE.format(brand=html.escape(h.server.cfg.brand), title=html.escape(title),
+                              api=json.dumps(h.server.cfg.public_base), script=script,
+                              buttons=buttons)
+    h._send(200, page.encode(), 'text/html; charset=UTF-8')
+
+
+@route('GET', r'/manage/library')
+def manage_library(h):
+    manage_page(h, 'Library', LIBRARY_SCRIPT,
+                '<button onclick="leave(\'handshakeFinish\')">Sync now</button>')
+
+
+@route('GET', r'/manage/devices')
+def manage_devices(h):
+    manage_page(h, 'Devices', DEVICES_SCRIPT,
+                '<button onclick="signOut()">Sign out all readers</button>')
+
+
+@route('GET', r'/manage/(handshakeFinish|handshakeCancel)')
+def manage_leave(h, what):
+    # Normally intercepted by the reader; reached only from a desktop browser.
+    h._send(200, b'You can close this page.', 'text/plain; charset=UTF-8')
+
+
+@route('GET', r'/onilot/library', 'token')
+def api_library(h):
+    h._send_json({'books': [{
+        'uuid': b['uuid'], 'title': b['title'], 'authors': ', '.join(b['authors']),
+        'uploaded': b['path'].name in h.server.uploads,
+    } for b in sorted(h.server.library.books(), key=lambda b: b['title'].lower())]})
+
+
+@route('GET', r'/onilot/devices', 'token')
+def api_devices(h):
+    devices = [dict(v, id=k) for k, v in h.server.devices.items()]
+    h._send_json({'devices': sorted(devices, key=lambda d: -d.get('last_seen', 0))})
+
+
+@route('POST', r'/onilot/devices/sign-out', 'token')
+def api_sign_out(h):
+    h.server.sign_out_everyone()
+    h._send_json({'signed_out': True})
+
+
 # ---- reading progress -----------------------------------------------------------------------
 
 @route('PATCH', r'/v4/reading-metadata', 'token')
@@ -711,6 +851,10 @@ class Server(ThreadingHTTPServer):
         self.refresh_tokens = set(saved.get('refresh', []))
         now = time.time()
         self.access_tokens = {t: exp for t, exp in saved.get('access', {}).items() if exp > now}
+        self.devices_path = Path(cfg.data) / 'devices.json'
+        self.devices = json.loads(self.devices_path.read_text()) \
+            if self.devices_path.exists() else {}
+        self.devices_lock = threading.Lock()
         self.uploads_path = Path(cfg.data) / 'uploads.json'
         self.uploads = set(json.loads(self.uploads_path.read_text())) \
             if self.uploads_path.exists() else set()
@@ -726,6 +870,24 @@ class Server(ThreadingHTTPServer):
         self.tokens_path.write_text(json.dumps({'refresh': sorted(self.refresh_tokens),
                                                 'access': self.access_tokens}))
         self.tokens_path.chmod(0o600)
+
+    def seen_device(self, headers):
+        hw = headers.get('Hardware-Id', '')[:64]
+        now = int(time.time())
+        with self.devices_lock:
+            entry = self.devices.setdefault(hw, {'first_seen': now})
+            previous = entry.get('last_seen', 0)
+            entry['last_seen'] = now
+            for field, limit in (('client_type', 64), ('client_version', 32)):
+                if headers.get(field):  # not every request carries these headers
+                    entry[field] = headers[field][:limit]
+            if now - previous > 60:  # do not rewrite the file on every request
+                self.devices_path.write_text(json.dumps(self.devices, indent=1))
+
+    def sign_out_everyone(self):
+        self.refresh_tokens.clear()
+        self.access_tokens.clear()
+        self.save_tokens()
 
     def mark_uploaded(self, filename):
         self.uploads.add(filename)
