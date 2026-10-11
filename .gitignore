@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+/library/
+/data/
+# never commit firmware or patched files
+*.tar
+*.tgz
+*.so
+*.so.*
+*.ext4
