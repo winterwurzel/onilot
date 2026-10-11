@@ -94,6 +94,7 @@ def start_server(base, port, lib, data, extra_env=None):
         [sys.executable, '-m', 'onilot'], cwd=str(REPO),
         env={**clean, 'ONILOT_PUBLIC_URL': base, 'ONILOT_LIBRARY': str(lib),
              'ONILOT_DATA': str(data), 'ONILOT_PORT': str(port), 'ONILOT_REQUEST_LOG': '1',
+             'ONILOT_SERIES_LOOKUP': 'off',
              **(extra_env or {})},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     for _ in range(100):
@@ -772,6 +773,34 @@ class DeviceFlowTest(unittest.TestCase):
         _, _, page = self.request('GET', self.origin + '/admin/users/fin/collections',
                                   headers={'Cookie': cookie})
         self.assertNotIn(b'collection_finished_readings_name', page)  # not a user collection
+
+    def test_admin_series_edit_reaches_the_reader(self):
+        token, books = self.new_user('ed', [('Plain Book', '', '')])
+        _, cookie, csrf = self.admin_login()
+        h = {'Cookie': cookie}
+        _, _, page = self.request('GET', self.origin + '/admin/series?tab=missing', headers=h)
+        self.assertIn(b'Plain Book', page)
+        self.assertIn(b'lookup is off', page)
+        key = 'plain book|jane author'
+        self.assertIn(('name=key value="%s"' % key).encode(), page)
+        for bad in ({'csrf': 'bad', 'action': 'set', 'key': key, 'series': 'X'},
+                    {'csrf': csrf, 'action': 'set', 'key': 'nope|x', 'series': 'X'},
+                    {'csrf': csrf, 'action': 'set', 'key': key, 'series': 'X', 'index': 'two'},
+                    {'csrf': csrf, 'action': 'accept', 'key': key}):
+            _, headers, _ = self.request('POST', self.origin + '/admin/series', headers=h,
+                                         form=bad)
+            self.assertIn('err=1', headers['Location'], bad)
+        self.request('POST', self.origin + '/admin/series', headers=h, form={
+            'csrf': csrf, 'action': 'set', 'key': key, 'series': 'Edited Saga', 'index': '2,5'})
+        tags = self.tag_patches(self.sync(token, '0', []), 'add')
+        self.assertEqual([(t['value']['name'], t['path'].split('/')[2]) for t in tags],
+                         [('Edited Saga', books['Plain Book'])])
+        _, _, page = self.request('GET', self.origin + '/admin/series?tab=all', headers=h)
+        self.assertIn(b'Edited Saga #2.5', page)
+        self.request('POST', self.origin + '/admin/series', headers=h,
+                     form={'csrf': csrf, 'action': 'clear', 'key': key})
+        _, _, page = self.request('GET', self.origin + '/admin/series?tab=missing', headers=h)
+        self.assertIn(b'Plain Book', page)
 
     def test_admin_collections_reject_bad_input(self):
         token, books = self.new_user('vic', [('Gamma', '', '')])

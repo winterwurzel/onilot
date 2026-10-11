@@ -169,11 +169,25 @@ books are not added to anyone's library automatically: the **shop tab** on the r
 store for them (Add / Remove), paged to fit the screen without scrolling, and the home screen
 recommends shared books the user has not added yet.
 
-Books with series metadata (Calibre `calibre:series` or EPUB 3 `belongs-to-collection`) get
-a collection per series on the reader, and the store and admin page show "Series #n". A
-series collection you delete or rename on the reader stays that way. Admins can also create,
-rename and delete each user's collections and add or remove books under
+Admins can create, rename and delete each user's collections and add or remove books under
 **Users > (user) > Collections**; changes reach the readers at their next sync.
+
+## Series
+
+Each series becomes a collection on the reader, and the store and admin page show
+"Series #n". The series comes from, in this order of priority:
+
+1. your edit in the admin page (**Series**),
+2. the EPUB's metadata (Calibre `calibre:series` or EPUB 3 `belongs-to-collection`),
+3. a lookup on [Wikidata](https://www.wikidata.org) for books without series metadata.
+
+The lookup sends each such book's title and authors to Wikidata (one book about every 2-3
+seconds, in the background; results are kept in `DATA/series.json`). Matches where title and
+author agree apply automatically; matches without author data wait under **Series > To
+review**. Wikidata knows well-known series; niche books often have no entry. Set
+`ONILOT_SERIES_LOOKUP=off` to disable the lookup. EPUB files are never modified.
+
+A series collection you delete or rename on the reader stays that way.
 
 ## On the reader
 
@@ -199,6 +213,7 @@ signed in, and cover URLs they stored keep working.
 | `ONILOT_PORT` / `ONILOT_BIND` | `8095` / `0.0.0.0` (image) | listen address |
 | `ONILOT_BRAND` | `onilot` | name shown on the reader |
 | `ONILOT_COUNTRY` | `DE` | country offered during setup |
+| `ONILOT_SERIES_LOOKUP` | `wikidata` | `off` = never contact Wikidata (see [Series](#series)) |
 | `ONILOT_REQUEST_LOG` | `0` | `1` = log every request/response to `DATA/requests.jsonl` (secrets redacted); useful when trying new firmware |
 
 Without Docker: `python3 -m onilot` (Python 3.10+, no dependencies).

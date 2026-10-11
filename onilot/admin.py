@@ -13,6 +13,7 @@ from pathlib import Path
 from onilot.server import (ADMIN_SESSION_TTL, Library, parse_multipart_file, route,
                            series_label, series_of, store_upload)
 from onilot import __version__
+from onilot.metadata import book_key
 from onilot.users import UserError
 
 SHARED = 'shared'
@@ -114,6 +115,7 @@ select { font:inherit; padding:.45rem .6rem; border-radius:8px; border:1px solid
 .members li:last-child { border-bottom:0; }
 .inline { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; }
 .inline input[type=text] { width:auto; flex:1; min-width:10rem; }
+.inline input.num { flex:none; width:4.5em; min-width:0; }
 @media (max-width:640px) { .hide-sm { display:none; } nav a { padding:.4rem .5rem; } }
 """
 
@@ -217,7 +219,7 @@ def page(h, title, body, active='', status=200, script='', extra_headers=None):
     signed_in = getattr(h, 'admin', None)
     nav = ''
     if signed_in:
-        links = [('', 'Overview'), ('/library', 'Library')]
+        links = [('', 'Overview'), ('/library', 'Library'), ('/series', 'Series')]
         nav = '<nav>%s</nav>' % ''.join(
             '<a href="%s"%s>%s</a>' % (esc(h._admin_url(p)), ' class="on"' if active == p else '',
                                        label) for p, label in links)
@@ -731,3 +733,138 @@ def collection_remove(ctx, form):
 COLLECTION_ACTIONS = {'create': collection_add, 'add': collection_add,
                       'rename': collection_rename, 'delete': collection_delete,
                       'remove': collection_remove}
+
+
+# ---- series (EPUB metadata, Wikidata lookups, manual edits) ------------------------------------
+
+SOURCE_BADGES = {'file': ('', 'from file'), 'auto': ('ok', 'Wikidata'),
+                 'accepted': ('ok', 'accepted'), 'manual': ('', 'manual')}
+SERIES_TABS = (('review', 'To review'), ('missing', 'No series'), ('all', 'All books'))
+
+
+def unique_books(h):
+    books = {}
+    for b in h.server.all_books():
+        books.setdefault(book_key(b['title'], b['authors']), b)
+    return sorted(books.items(), key=lambda kv: (kv[1]['series'] or '~', kv[1]['series_index']
+                                                 or 0, kv[1]['title'].lower()))
+
+
+def lookup_status(h):
+    worker = h.server.series_lookup
+    if worker is None:
+        return 'Wikidata lookup is off (ONILOT_SERIES_LOOKUP=off).'
+    status = worker.status
+    text = ('Looking up series on Wikidata: %d books left.' % status['pending']
+            if status['running'] else 'Wikidata lookup idle; new books are checked every 10 min.')
+    if status['error']:
+        text += ' Last error: %s' % status['error']
+    return text
+
+
+def series_row(h, key, book, entry):
+    hidden = ('<input type=hidden name=csrf value="%s"><input type=hidden name=key value="%s">'
+              % (esc(h.csrf), esc(key)))
+    url = esc(h._admin_url('/series'))
+    badge = SOURCE_BADGES.get(book.get('series_source'))
+    current = ('%s <span class="badge %s">%s</span>' % (esc(series_label(book)), badge[0],
+                                                        badge[1]) if book['series'] else
+               '<span class="muted">none</span>')
+    suggestion = ''
+    if entry and entry.get('status') == 'suggested':
+        suggestion = (
+            '<div class="small">Wikidata suggests <b>%s</b> (matched <a href="https://www.'
+            'wikidata.org/wiki/%s" target="_blank" rel="noopener">%s</a>)</div>'
+            '<div class="row"><form method=post action="%s">%s<input type=hidden name=action '
+            'value=accept><button class="primary small">Accept</button></form>'
+            '<form method=post action="%s">%s<input type=hidden name=action value=reject>'
+            '<button class="small">Reject</button></form></div>' % (
+                esc(series_label({'series': entry.get('series'), 'series_index':
+                                  entry.get('index')})), esc(entry.get('qid', '')),
+                esc(entry.get('match') or entry.get('qid')), url, hidden, url, hidden))
+    clear = ('<form method=post action="%s">%s<input type=hidden name=action value=clear>'
+             '<button class="link small">undo edit</button></form>' % (url, hidden)
+             if entry and entry.get('status') in ('manual', 'accepted', 'rejected') else '')
+    edit = ('<form method=post action="%s" class="inline">%s<input type=hidden name=action '
+            'value=set><input type=text name=series maxlength=100 placeholder="Series" '
+            'value="%s" aria-label="Series"><input type=text name=index maxlength=8 '
+            'placeholder="#" value="%s" class="num" aria-label="Number">'
+            '<button class="small">Save</button></form>' % (
+                url, hidden, esc(book['series'] or ''),
+                esc('%g' % book['series_index'] if book['series_index'] is not None else '')))
+    return ('<tr><td><b>%s</b><div class="muted small">%s</div>%s</td><td>%s%s</td>'
+            '<td>%s</td></tr>' % (esc(book['title']), esc(', '.join(book['authors'])),
+                                  suggestion, current, clear, edit))
+
+
+@route('GET', r'/admin/series', 'admin')
+def admin_series(h):
+    tab = h.query.get('tab', ['review'])[0]
+    rows, counts = [], {'review': 0, 'missing': 0, 'all': 0}
+    for key, book in unique_books(h):
+        entry = h.server.series.get(key)
+        kinds = {'all'}
+        if entry and entry.get('status') == 'suggested' and not book['series']:
+            kinds.add('review')
+        if not book['series']:
+            kinds.add('missing')
+        for kind in kinds:
+            counts[kind] = counts.get(kind, 0) + 1
+        if tab in kinds:
+            rows.append(series_row(h, key, book, entry))
+    tabs = ''.join('<a href="%s"%s>%s (%d)</a>' % (
+        esc(h._admin_url('/series?tab=' + t)), ' class="on"' if t == tab else '', label,
+        counts.get(t, 0)) for t, label in SERIES_TABS)
+    body = ('<div class="spread"><h1 style="margin:0">Series</h1>'
+            '<form method=post action="%s"><input type=hidden name=csrf value="%s">'
+            '<input type=hidden name=action value=lookup><button>Look up again</button></form>'
+            '</div><p class="muted small">%s Series from the EPUB files win over Wikidata; your '
+            'edits win over both. Each series is a collection on the reader.</p>'
+            '<div class="tabs">%s</div><div class="card">%s</div>' % (
+                esc(h._admin_url('/series')), esc(h.csrf), esc(lookup_status(h)), tabs,
+                '<table><tr><th>Book</th><th>Series</th><th>Edit</th></tr>%s</table>'
+                % ''.join(rows) if rows else '<div class="empty">Nothing here.</div>'))
+    page(h, 'Series', body, active='/series')
+
+
+@route('POST', r'/admin/series', 'admin')
+def admin_series_action(h):
+    form = h._form()
+    back = h.headers.get('Referer', '')
+    path = '/series' + (back[back.index('?'):] if '?tab=' in back else '')
+    if not csrf_ok(h, form):
+        go(h, path, 'Form expired, please try again.', error=True)
+        return
+    store, key, action = h.server.series, form.get('key', ''), form.get('action')
+    entry = store.get(key)
+    if action == 'lookup':
+        store.forget(('none', 'error'))
+        if h.server.series_lookup is not None:
+            h.server.series_lookup.wake.set()
+        go(h, path, 'Looking up books without series again.')
+    elif action == 'accept' and entry and entry.get('status') == 'suggested':
+        store.update(key, status='accepted')
+        go(h, path, 'Accepted %s.' % entry.get('series'))
+    elif action == 'reject' and entry and entry.get('status') == 'suggested':
+        store.update(key, status='rejected')
+        go(h, path, 'Rejected the suggestion.')
+    elif action == 'set' and key in dict(unique_books(h)):
+        series_edit(h, store, key, form, path)
+    elif action == 'clear' and entry:
+        store.remove(key)
+        go(h, path, 'Edit undone.')
+    else:
+        go(h, path, 'Unknown request.', error=True)
+
+
+def series_edit(h, store, key, form, path):
+    series = (form.get('series') or '').strip()[:100] or None
+    index = (form.get('index') or '').strip().replace(',', '.')
+    try:
+        index = float(index) if index and series else None
+    except ValueError:
+        go(h, path, 'The number must be a number, like 2 or 2.5.', error=True)
+        return
+    store.put(key, status='manual', series=series, index=index)
+    go(h, path, 'Saved: %s.' % (series_label({'series': series, 'series_index': index})
+                                or 'no series'))

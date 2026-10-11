@@ -48,6 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from onilot import __version__
+from onilot.metadata import Lookup, SeriesStore
 from onilot.users import UserError, UserStore, check_name, cli as user_cli
 
 RESELLER_ID = 1
@@ -101,6 +102,7 @@ class Library:
 
     _meta_cache = {}
     _meta_lock = threading.Lock()
+    series_store = None   # SeriesStore: series found on Wikidata or set in the admin page
 
     def __init__(self, roots, shelf=None):
         self.roots = [(Path(d), prefix, shared) for d, prefix, shared in roots]
@@ -114,9 +116,11 @@ class Library:
                 uuid = hashlib.sha1((prefix + path.name).encode()).hexdigest()
                 if shared and self.shelf is not None and uuid not in self.shelf:
                     continue
+                meta = self._cached_metadata(path, stat)
+                if self.series_store is not None:
+                    meta = self.series_store.apply(meta)
                 result.append({'uuid': uuid, 'path': path, 'size': stat.st_size,
-                               'mtime': int(stat.st_mtime * 1000), 'shared': shared,
-                               **self._cached_metadata(path, stat)})
+                               'mtime': int(stat.st_mtime * 1000), 'shared': shared, **meta})
         return result
 
     def _cached_metadata(self, path, stat):
@@ -1406,6 +1410,9 @@ class Server(ThreadingHTTPServer):
             secret_path.write_bytes(secrets.token_bytes(32))
             secret_path.chmod(0o600)
         self.signing_key = secret_path.read_bytes()
+        self.series = SeriesStore(cfg.data)
+        Library.series_store = self.series
+        self.series_lookup = None   # Lookup thread, unless ONILOT_SERIES_LOOKUP=off
 
     def context(self, user):
         with self.contexts_lock:
@@ -1415,6 +1422,11 @@ class Server(ThreadingHTTPServer):
 
     def shared_library(self):
         return Library([(self.shared_dir, 'shared/', True)])
+
+    def all_books(self):
+        """Every book on the server: all users' libraries and the whole shared library."""
+        roots = [(Path(self.cfg.library) / name, '', False) for name in self.users.names()]
+        return Library(roots + [(self.shared_dir, 'shared/', True)]).books()
 
     def record_deletion(self, owner, uuid):
         with self.deletions_lock:
@@ -1532,6 +1544,9 @@ def main(argv=None):
     p.add_argument('--brand', default=env('ONILOT_BRAND', 'onilot'))
     p.add_argument('--country', default=env('ONILOT_COUNTRY', 'DE'),
                    help='country code offered during reader setup (ONILOT_COUNTRY)')
+    p.add_argument('--series-lookup', choices=('wikidata', 'off'),
+                   default=env('ONILOT_SERIES_LOOKUP', 'wikidata'),
+                   help='look up series of books without series metadata (ONILOT_SERIES_LOOKUP)')
     p.add_argument('--request-log', action='store_true', default=env_flag('ONILOT_REQUEST_LOG'),
                    help='log every request to DATA/requests.jsonl (ONILOT_REQUEST_LOG=1)')
     cfg = p.parse_args(argv)
@@ -1567,9 +1582,13 @@ def main(argv=None):
               '"python -m onilot user" or /admin)', flush=True)
 
     server = Server(cfg, users)
-    print('onilot %s: %d users, listening on %s:%d, API prefix %r, request log %s' % (
-        __version__, len(users.names()), cfg.bind, cfg.port, cfg.prefix,
-        cfg.log_file if cfg.request_log else 'off'), flush=True)
+    if cfg.series_lookup == 'wikidata':
+        server.series_lookup = Lookup(server.series, server.all_books)
+        server.series_lookup.start()
+    print('onilot %s: %d users, listening on %s:%d, API prefix %r, request log %s, '
+          'series lookup %s' % (__version__, len(users.names()), cfg.bind, cfg.port, cfg.prefix,
+                                cfg.log_file if cfg.request_log else 'off', cfg.series_lookup),
+          flush=True)
     server.serve_forever()
 
 
