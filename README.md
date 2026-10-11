@@ -19,7 +19,7 @@ yourself instead of the vendor cloud.
 | Library sync, covers, book download | ✓ |
 | Reading position sync, both directions, last write wins | ✓ |
 | Books copied to the reader over USB are uploaded to the server automatically | ✓ |
-| Home screen recommendations, shop tab (lists the server's books) | ✓ |
+| Shop tab as a store for shared books (add/remove), home screen recommendations | ✓ |
 | Collections sync | ✓ |
 | Settings > account: library page with **Sync now**, device list with sign-out | ✓ |
 | Adobe DRM / vendor DRM books, audiobooks, highlights/notes sync | ✗ |
@@ -157,10 +157,12 @@ on a reader only affects that user. Usernames are lowercase `a-z 0-9 . _ -`.
 | Directory (in the library volume) | Visible to |
 |---|---|
 | `<user>/` | that user only; books copied onto their reader over USB are uploaded here |
-| `shared/` | everyone |
+| `shared/` | everyone, via the store: each user adds the shared books they want |
 
-DRM-free EPUBs show up on the reader at its next sync (or "Sync now", see below). The shop
-tab on the reader has no login, so it only lists shared books.
+DRM-free EPUBs show up on the reader at its next sync (or "Sync now", see below). Shared
+books are not added to anyone's library automatically: the **shop tab** on the reader is a
+store for them (Add to my library / Remove), and the home screen recommends shared books the
+user has not added yet.
 
 ## On the reader
 
