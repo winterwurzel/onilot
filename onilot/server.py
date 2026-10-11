@@ -132,7 +132,7 @@ class Library:
 
     def _metadata(self, path):
         meta = {'title': path.stem, 'authors': [], 'language': None, 'publisher': None,
-                'cover': None}
+                'cover': None, 'series': None, 'series_index': None}
         try:
             with zipfile.ZipFile(path) as z:
                 container = ET.fromstring(z.read('META-INF/container.xml'))
@@ -147,9 +147,34 @@ class Library:
                 meta['publisher'] = md.findtext('dc:publisher', default=None,
                                                 namespaces=self.OPF_NS)
                 meta['cover'] = self._cover_href(opf, opf_path, z)
+                meta['series'], meta['series_index'] = self._series(md)
         except (KeyError, ET.ParseError, zipfile.BadZipFile, AttributeError) as exc:
             print('warning: cannot read metadata of %s: %s' % (path.name, exc))
         return meta
+
+    def _series(self, md):
+        """Series name and position from Calibre or EPUB 3 metadata, else (None, None)."""
+        name = index = None
+        for meta in md.findall('opf:meta', self.OPF_NS):
+            if meta.get('name') == 'calibre:series':
+                name = (meta.get('content') or '').strip() or None
+            elif meta.get('name') == 'calibre:series_index':
+                index = meta.get('content')
+        if name is None:
+            for meta in md.findall('opf:meta', self.OPF_NS):
+                if meta.get('property') != 'belongs-to-collection' or not (meta.text or '').strip():
+                    continue
+                ref = '#' + (meta.get('id') or '')
+                refines = {m.get('property'): (m.text or '').strip()
+                           for m in md.findall('opf:meta', self.OPF_NS) if m.get('refines') == ref}
+                if refines.get('collection-type', 'series') == 'series':
+                    name, index = meta.text.strip(), refines.get('group-position')
+                    break
+        try:
+            index = float(index) if index not in (None, '') else None
+        except ValueError:
+            index = None
+        return name, index if name else None
 
     IMAGE_TYPES = ('image/jpeg', 'image/png', 'image/gif', 'image/webp')
 
@@ -282,9 +307,127 @@ class State:
                 self.docs[base] = self._new_doc(value)
 
     def _new_doc(self, value):
-        doc = {'id': self.next_id, 'revision': self.revision, 'value': value, 'deleted': False}
+        # "created": revision at creation; a reader that has not seen that revision gets the
+        # document as an "add" (it does not know the id yet), later changes as "replace".
+        doc = {'id': self.next_id, 'revision': self.revision, 'created': self.revision,
+               'value': value, 'deleted': False}
         self.next_id += 1
         return doc
+
+    def _save(self):
+        self.path.write_text(json.dumps({'revision': self.revision, 'next_id': self.next_id,
+                                         'docs': self.docs}, indent=1))
+
+    def _create(self, list_path, value, **extra):
+        self.revision += 1
+        doc = self._new_doc(value)
+        doc['created'] = doc['revision'] = self.revision
+        doc.update(extra)
+        key = '%s/%d' % (list_path, doc['id'])
+        self.docs[key] = doc
+        return key
+
+    # ---- collections (tags with category "collection") -------------------------------------
+
+    def collections(self):
+        """{collection name: [(doc key, publication uuid)]} of live collection tags."""
+        result = {}
+        with self.lock:
+            for key, doc in self.docs.items():
+                value = doc.get('value') or {}
+                parts = key.split('/')
+                if (len(parts) == 5 and parts[3] == 'tags' and not doc.get('deleted')
+                        and value.get('category') == 'collection' and value.get('name')):
+                    result.setdefault(value['name'], []).append((key, parts[2]))
+        return result
+
+    def auto_collections(self):
+        """Names of live collections created from series metadata."""
+        with self.lock:
+            return {doc['value']['name'] for doc in self.docs.values()
+                    if doc.get('auto_series') and not doc.get('deleted')}
+
+    def _has_collection_tag(self, uuid, name):
+        prefix = '/publications/%s/tags/' % uuid
+        return any(key.startswith(prefix) and not doc.get('deleted')
+                   and (doc.get('value') or {}).get('category') == 'collection'
+                   and (doc.get('value') or {}).get('name') == name
+                   for key, doc in self.docs.items())
+
+    def add_to_collection(self, name, uuid):
+        with self.lock:
+            if not self._has_collection_tag(uuid, name):
+                self._create('/publications/%s/tags' % uuid, {
+                    'name': name, 'category': 'collection', 'modified': int(time.time() * 1000)})
+                self._save()
+
+    def remove_tag(self, key):
+        with self.lock:
+            doc = self.docs.get(key)
+            if doc and not doc.get('deleted'):
+                self.revision += 1
+                doc.update(deleted=True, revision=self.revision)
+                self._save()
+
+    def rename_collection(self, old, new):
+        now = int(time.time() * 1000)
+        with self.lock:
+            for doc in self.docs.values():
+                value = doc.get('value') or {}
+                if (not doc.get('deleted') and value.get('category') == 'collection'
+                        and value.get('name') == old):
+                    self.revision += 1
+                    doc['value'] = dict(value, name=new, modified=now)
+                    doc['revision'] = self.revision
+            self._save()
+
+    def update_series_collections(self, series_by_uuid):
+        with self.lock:
+            if self.ensure_series_collections(series_by_uuid):
+                self._save()
+
+    def ensure_series_collections(self, series_by_uuid):
+        """Keep one auto collection tag per (book, series). Called with the lock held.
+
+        A tag the user removed on the reader stays removed (its deleted doc is remembered).
+        """
+        now = int(time.time() * 1000)
+        changed = False
+        auto, live_name, kept = {}, {}, set()
+        for key, doc in self.docs.items():
+            series = doc.get('auto_series')
+            if series:
+                auto[(key.split('/')[2], series)] = doc
+                if not doc.get('deleted'):
+                    live_name[series] = doc['value']['name']
+                if not doc.get('book_gone'):
+                    kept.add(series)  # live, or deleted by the user
+        for uuid, series in series_by_uuid.items():
+            doc = auto.get((uuid, series))
+            if doc is not None and not doc.get('book_gone'):
+                continue
+            if series in kept and series not in live_name:
+                continue  # the user deleted the whole series collection: leave it deleted
+            name = live_name.get(series, series)  # follow a rename
+            if self._has_collection_tag(uuid, name):
+                continue
+            self.revision += 1
+            if doc is not None:  # the book is back in the library
+                doc.update(deleted=False, book_gone=False, revision=self.revision,
+                           created=self.revision, value=dict(doc['value'], name=name,
+                                                             modified=now))
+            else:
+                self._create('/publications/%s/tags' % uuid, {
+                    'name': name, 'category': 'collection', 'modified': now}, auto_series=series)
+            kept.add(series)
+            live_name[series] = name
+            changed = True
+        for (uuid, series), doc in auto.items():
+            if series_by_uuid.get(uuid) != series and not doc.get('deleted'):
+                self.revision += 1
+                doc.update(deleted=True, book_gone=True, revision=self.revision)
+                changed = True
+        return changed
 
     @staticmethod
     def doc_key(path):
@@ -350,7 +493,7 @@ class State:
             echoes[full] = {'op': 'replace', 'path': full, 'value': dict(doc['value'])}
         return changed
 
-    def sync(self, client_revision, patches):
+    def sync(self, client_revision, patches, series_by_uuid=None):
         """Apply client patches; return (new revision, patches for the client)."""
         try:
             client_revision = int(client_revision)
@@ -361,6 +504,8 @@ class State:
             changed = False
             for patch in patches:
                 changed = self._apply(patch, echoes, touched) or changed
+            if series_by_uuid is not None:
+                changed = self.ensure_series_collections(series_by_uuid) or changed
             # The device ignores a response whose revision equals its own ("already up-to-date"):
             # id confirmations are then lost and accepted replaces are re-sent on every sync.
             # So any response to incoming patches carries a new revision.
@@ -378,15 +523,18 @@ class State:
                 if base in touched or doc['revision'] <= client_revision:
                     continue
                 full = self.full_path(base, doc)
+                # Bookmarks (one per book) go out as "replace" even when new: verified on the
+                # device. List items (tags, ...) the reader has never seen must be an "add".
+                new_to_client = (doc.get('created', 0) > client_revision
+                                 and base.rpartition('/')[0].rpartition('/')[2] in COLLECTIONS)
                 if doc['deleted']:
-                    outgoing.append({'op': 'remove', 'path': full})
+                    if not new_to_client:  # never sent to this reader: nothing to remove
+                        outgoing.append({'op': 'remove', 'path': full})
                 else:
-                    outgoing.append({'op': 'replace', 'path': full,
+                    outgoing.append({'op': 'add' if new_to_client else 'replace', 'path': full,
                                      'value': dict(doc['value'], revision=str(doc['revision']))})
             if changed or not self.path.exists():
-                self.path.write_text(json.dumps({'revision': self.revision,
-                                                 'next_id': self.next_id,
-                                                 'docs': self.docs}, indent=1))
+                self._save()
             return str(self.revision), echoes + outgoing
 
 
@@ -781,22 +929,82 @@ def cover(h, kind, *rest):
 
 # ---- shop tab (webview) -----------------------------------------------------------------
 
+# E-paper friendly: no scrolling. The script measures how many books fit on the screen and
+# pages through them with large buttons; without the script the list simply scrolls.
 STORE_CSS = """
-body { margin:0; font:20px/1.45 sans-serif; color:#000; background:#fff; }
-header { padding:.8em 1em; border-bottom:2px solid #000; display:flex; gap:1em;
-  align-items:center; flex-wrap:wrap; }
-header h1 { font-size:1.3em; margin:0; flex:1; }
+* { box-sizing:border-box; }
+html, body { height:100%; }
+body { margin:0; font:18px/1.35 sans-serif; color:#000; background:#fff; display:flex;
+  flex-direction:column; }
+header { padding:.6em .8em; border-bottom:2px solid #000; display:flex; gap:.8em;
+  align-items:center; flex-wrap:wrap; flex:none; }
+header h1 { font-size:1.25em; margin:0; flex:1; white-space:nowrap; }
 form.search { display:flex; gap:.4em; } input[type=search] { font:inherit; padding:.3em .5em;
-  border:2px solid #000; border-radius:6px; width:11em; }
-main { padding:1em; } .note { border:2px solid #000; border-radius:8px; padding:.6em .8em;
-  margin-bottom:1em; } .book { display:flex; gap:1em; padding:1em 0; border-bottom:1px solid #000; }
-.book img, .book .ph { width:5.5em; height:8.2em; object-fit:cover; border:1px solid #000;
-  flex:none; display:grid; place-items:center; font-size:1.6em; font-weight:700; }
-.book h2 { font-size:1.05em; margin:0 0 .2em; } .by { margin:0 0 .6em; }
-button { font:inherit; padding:.35em .9em; border:2px solid #000; border-radius:8px;
+  border:2px solid #000; border-radius:6px; width:10em; }
+.note { border:2px solid #000; border-radius:8px; padding:.5em .7em; margin:.6em .8em 0;
+  flex:none; }
+main { flex:1; padding:0 .8em; display:grid; align-content:start;
+  grid-template-columns:repeat(auto-fill, minmax(15em, 1fr)); column-gap:1em; }
+.paged main { overflow:hidden; }
+.book { display:flex; gap:.8em; padding:.7em 0; border-bottom:1px solid #000; height:8.8em;
+  overflow:hidden; }
+.paged .book.off { display:none; }
+.book img, .book .ph { width:4.8em; height:7.2em; object-fit:cover; border:1px solid #000;
+  flex:none; display:grid; place-items:center; font-size:1em; font-weight:700; }
+.book .ph { font-size:2em; }
+.book div { min-width:0; display:flex; flex-direction:column; }
+.book h2 { font-size:1em; margin:0; max-height:2.7em; overflow:hidden; }
+.by, .series { margin:.1em 0 0; max-height:1.35em; overflow:hidden; } .series { font-style:italic; }
+.book form { margin-top:auto; display:flex; align-items:center; gap:.5em; flex-wrap:wrap; }
+button { font:inherit; padding:.3em .8em; border:2px solid #000; border-radius:8px;
   background:#fff; color:#000; } button.add { background:#000; color:#fff; }
-.owned { font-weight:700; margin-right:.6em; } .empty { padding:2em 0; text-align:center; }
+button:disabled { border-style:dashed; color:#777; }
+.owned { font-weight:700; } .empty { padding:2em 0; text-align:center; grid-column:1/-1; }
+nav { display:none; flex:none; border-top:2px solid #000; padding:.5em .8em;
+  align-items:center; gap:.8em; }
+.paged nav { display:flex; }
+nav button { flex:1; padding:.6em; font-size:1.1em; font-weight:700; }
+nav span { min-width:7em; text-align:center; }
 """
+
+STORE_JS = """
+(function () {
+  var main = document.querySelector('main');
+  var books = [].slice.call(main.querySelectorAll('.book'));
+  if (!books.length) return;
+  document.body.className = 'paged';
+  var cols = books.filter(function (b) { return b.offsetTop === books[0].offsetTop; }).length;
+  var rows = Math.max(1, Math.floor(main.clientHeight / books[0].offsetHeight));
+  var per = cols * rows, pages = Math.ceil(books.length / per), page = 0;
+  var focus = document.getElementById('focus');
+  if (focus) page = Math.floor(books.indexOf(focus) / per);
+  var prev = document.getElementById('prev'), next = document.getElementById('next');
+  function show() {
+    books.forEach(function (b, i) {
+      b.className = Math.floor(i / per) === page ? 'book' : 'book off';
+    });
+    document.getElementById('pageno').textContent = 'Page ' + (page + 1) + ' of ' + pages;
+    prev.disabled = page === 0;
+    next.disabled = page >= pages - 1;
+  }
+  prev.onclick = function () { if (page > 0) { page--; show(); } };
+  next.onclick = function () { if (page < pages - 1) { page++; show(); } };
+  show();
+})();
+"""
+
+
+def series_of(library):
+    return {b['uuid']: b['series'] for b in library.books() if b['series']}
+
+
+def series_label(book):
+    if not book.get('series'):
+        return ''
+    index = book.get('series_index')
+    if index is None:
+        return book['series']
+    return '%s #%s' % (book['series'], ('%g' % index))
 
 
 def store_page(h, books, query, focus):
@@ -818,10 +1026,12 @@ def store_page(h, books, query, focus):
                                    html.escape(token), html.escape(query),
                                    '<span class="owned">In your library</span>' if owned else '',
                                    '' if owned else 'add',
-                                   'Remove' if owned else 'Add to my library'))
-        rows.append('<div class="book"%s>%s<div><h2>%s</h2><p class="by">%s</p>%s</div></div>' % (
+                                   'Remove' if owned else 'Add'))
+        series = series_label(b)
+        rows.append('<div class="book"%s>%s<div><h2>%s</h2><p class="by">%s</p>%s%s</div></div>' % (
             ' id="focus"' if b['uuid'] == focus else '', cover, html.escape(b['title']),
-            html.escape(', '.join(b['authors'])), action))
+            html.escape(', '.join(b['authors'])),
+            '<p class="series">%s</p>' % html.escape(series) if series else '', action))
     message = h.query.get('msg', [''])[0]
     notes = ('<div class="note">%s</div>' % html.escape(message)) if message else ''
     if not h.user:
@@ -829,11 +1039,13 @@ def store_page(h, books, query, focus):
     doc = """<!doctype html><html><head><meta charset="utf-8">
 <meta name=viewport content="width=device-width"><title>{brand}</title><style>{css}</style>
 </head><body><header><h1>{brand} store</h1><form class="search" action="{action}">
-<input type=search name=q value="{q}" placeholder="Title or author"><button>Search</button>
-</form></header><main>{notes}{rows}</main>
-<script>var f = document.getElementById('focus'); if (f) f.scrollIntoView();</script>
-</body></html>""".format(brand=brand, css=STORE_CSS, action=html.escape(h._url('/shop')),
-                         q=html.escape(query), notes=notes,
+<input type=search name=q value="{q}" placeholder="Title, author, series"><button>Search</button>
+</form></header>{notes}<main>{rows}</main>
+<nav><button id="prev">&lsaquo; Previous</button><span id="pageno"></span>
+<button id="next">Next &rsaquo;</button></nav>
+<script>{js}</script>
+</body></html>""".format(brand=brand, css=STORE_CSS, js=STORE_JS,
+                         action=html.escape(h._url('/shop')), q=html.escape(query), notes=notes,
                          rows=''.join(rows) or '<div class="empty">No books found.</div>')
     h._send(200, doc.encode(), 'text/html; charset=UTF-8')
 
@@ -843,14 +1055,29 @@ def store_page(h, books, query, focus):
 # the access token as X-Access-Token, so the store knows the user.
 # Some shop entry points concatenate SHOP_BASE + URL_SHOP_EBOOK_START_PAGE, producing
 # /shophttps://<host>/<prefix>/shop, so accept anything after /shop.
+def store_order(books):
+    """Newest first; a series stays together, in reading order, at its newest book."""
+    newest = {}
+    for b in books:
+        if b['series']:
+            newest[b['series']] = max(newest.get(b['series'], 0), b['mtime'])
+
+    def key(b):
+        if b['series']:
+            return (-newest[b['series']], b['series'], b['series_index'] or 0, b['title'])
+        return (-b['mtime'], '', 0, b['title'])
+    return sorted(books, key=key)
+
+
 @route('GET', r'/shop(?:https?://.*)?')
 def shop(h):
     query = h.query.get('q', [''])[0].strip()
     focus = h.query.get('id', [''])[0]
     needle = query.lower()
-    books = [b for b in sorted(h.server.shared_library().books(), key=lambda b: -b['mtime'])
+    books = [b for b in store_order(h.server.shared_library().books())
              if not needle or needle in b['title'].lower()
-             or any(needle in a.lower() for a in b['authors'])]
+             or any(needle in a.lower() for a in b['authors'])
+             or needle in (b['series'] or '').lower()]
     store_page(h, books, query, focus)
 
 
@@ -1077,7 +1304,8 @@ def api_sign_out(h):
 @route('PATCH', r'/v4/reading-metadata', 'token')
 def reading_metadata(h):
     request = json.loads(h.body or b'{}')
-    revision, patches = h.ctx.state.sync(request.get('revision'), request.get('patches', []))
+    revision, patches = h.ctx.state.sync(request.get('revision'), request.get('patches', []),
+                                         series_of(h.ctx.library))
     h._send_json({'revision': revision, 'patches': patches, 'conflicts': []})
 
 

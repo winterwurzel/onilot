@@ -61,6 +61,22 @@ def make_epub(path, title='Test Book'):
         z.writestr('OEBPS/cover.jpg', b'\xff\xd8fakejpeg')
 
 
+def make_series_epub(path, title, series, index, epub3=False):
+    if epub3:
+        meta = ('<meta property="belongs-to-collection" id="s">%s</meta>'
+                '<meta refines="#s" property="collection-type">series</meta>'
+                '<meta refines="#s" property="group-position">%s</meta>' % (series, index))
+    else:
+        meta = ('<meta name="calibre:series" content="%s"/>'
+                '<meta name="calibre:series_index" content="%s"/>' % (series, index))
+    with zipfile.ZipFile(path, 'w') as z:
+        z.writestr('mimetype', 'application/epub+zip')
+        z.writestr('META-INF/container.xml', CONTAINER)
+        z.writestr('OEBPS/content.opf', OPF.replace('{title}', title).replace(
+            '</metadata>', meta + '</metadata>'))
+        z.writestr('OEBPS/cover.jpg', b'\xff\xd8fakejpeg')
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args):
         return None
@@ -118,6 +134,7 @@ class DeviceFlowTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.proc.terminate()
         cls.proc.wait()
+        cls.proc.stdout.close()
         cls.tmp.cleanup()
 
     def request(self, method, path, body=None, headers=None, form=None):
@@ -526,9 +543,9 @@ class DeviceFlowTest(unittest.TestCase):
         bob, _ = self.login('bob', BOB_PASSWORD)
         _, _, anonymous = self.request('GET', '/shop')
         self.assertIn(b'Shared Book', anonymous)
-        self.assertNotIn(b'Add to my library', anonymous)
+        self.assertNotIn(b'>Add</button>', anonymous)
         _, _, page = self.request('GET', '/shop', headers={'X-Access-Token': bob['access_token']})
-        self.assertIn(b'Add to my library', page)
+        self.assertIn(b'>Add</button>', page)
         self.assertIn(b'/covers/bob/', page)
 
     def test_store_actions_need_a_token(self):
@@ -596,6 +613,183 @@ class DeviceFlowTest(unittest.TestCase):
         svg = server.generated_cover('<script>alert(1)</script> & more', 'A & B')
         self.assertNotIn(b'<script>', svg)
         self.assertIn(b'&amp;', svg)
+
+
+    # ---- series, collections, e-paper store ------------------------------------------------
+
+    def new_user(self, name, books=()):
+        """A fresh user with its own library: [(title, series, index)]."""
+        result = user_cli(self.data, 'add', name, '--password-stdin', stdin='pw-%s-123\n' % name)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.lib / name).mkdir(exist_ok=True)
+        for i, (title, series, index) in enumerate(books):
+            make_series_epub(self.lib / name / ('%d.epub' % i), title, series, index,
+                             epub3=i % 2 == 1)
+        tokens, _ = self.login(name, 'pw-%s-123' % name)
+        return tokens['access_token'], {t: v['uuid'] for t, v in
+                                        self.inventory_titles(tokens['access_token']).items()}
+
+    @staticmethod
+    def tag_patches(resp, op=None):
+        return [p for p in resp['patches'] if '/tags/' in p['path'] and (op is None or
+                                                                          p['op'] == op)]
+
+    def test_series_metadata(self):
+        sys.path.insert(0, str(REPO))
+        import importlib
+        server = importlib.import_module('onilot.server')
+        self.assertEqual(server.series_label({'series': 'Saga', 'series_index': 3.5}), 'Saga #3.5')
+        self.assertEqual(server.series_label({'series': 'Saga', 'series_index': 2.0}), 'Saga #2')
+        self.assertEqual(server.series_label({'series': None, 'series_index': None}), '')
+        books = {}
+        for i, epub3 in enumerate((False, True)):
+            path = Path(self.tmp.name, 'series%d.epub' % i)
+            make_series_epub(path, 'Book %d' % i, 'Saga', '3.5', epub3=epub3)
+            books[epub3] = server.Library([])._metadata(path)
+        for book in books.values():
+            self.assertEqual((book['series'], book['series_index']), ('Saga', 3.5))
+
+    def test_series_become_collections_on_the_reader(self):
+        token, books = self.new_user('dora', [('Saga One', 'Saga', '1'),
+                                              ('Saga Two', 'Saga', '2')])
+        resp = self.sync(token, '0', [])
+        adds = self.tag_patches(resp, 'add')
+        self.assertEqual({p['path'].split('/')[2] for p in adds}, set(books.values()))
+        self.assertTrue(all(p['value']['name'] == 'Saga' and p['value']['category'] ==
+                            'collection' and 'transientId' not in p['value'] for p in adds))
+        # nothing new on the next sync
+        self.assertEqual(self.tag_patches(self.sync(token, resp['revision'], [])), [])
+        # a book removed from the collection on the reader stays removed
+        removed = adds[0]['path']
+        resp = self.sync(token, resp['revision'], [{'op': 'remove', 'path': removed}])
+        resp = self.sync(token, resp['revision'], [])
+        self.assertEqual(self.tag_patches(resp), [])
+        # a second reader never gets the removed tag, only the remaining one, as an "add"
+        fresh = self.sync(token, '0', [])
+        self.assertEqual([p['path'] for p in self.tag_patches(fresh)], [adds[1]['path']])
+        self.assertEqual(self.tag_patches(fresh)[0]['op'], 'add')
+        # after deleting the whole collection, a new book of the series does not bring it back
+        resp = self.sync(token, resp['revision'], [{'op': 'remove', 'path': adds[1]['path']}])
+        make_series_epub(self.lib / 'dora' / 'three.epub', 'Saga Three', 'Saga', '3')
+        resp = self.sync(token, resp['revision'], [])
+        self.assertEqual(self.tag_patches(resp), [])
+
+    def test_series_collection_survives_a_book_leaving_and_returning(self):
+        token, books = self.new_user('lea', [('Loop One', 'Loop', '1'),
+                                             ('Loop Two', 'Loop', '2')])
+        resp = self.sync(token, '0', [])
+        moved = self.lib / 'lea' / '0.epub'
+        parked = Path(self.tmp.name, 'parked.epub')
+        moved.rename(parked)
+        resp = self.sync(token, resp['revision'], [])
+        self.assertEqual([p['op'] for p in self.tag_patches(resp)], ['remove'])
+        parked.rename(moved)
+        resp = self.sync(token, resp['revision'], [])
+        self.assertEqual([(p['op'], p['path'].split('/')[2]) for p in self.tag_patches(resp)],
+                         [('add', books['Loop One'])])
+
+    def test_series_collection_follows_a_rename(self):
+        token, _ = self.new_user('ren', [('Cycle One', 'Cycle', '1')])
+        resp = self.sync(token, '0', [])
+        path = self.tag_patches(resp, 'add')[0]['path']
+        resp = self.sync(token, resp['revision'], [{'op': 'replace', 'path': path, 'value': {
+            'name': 'My Cycle', 'category': 'collection', 'modified': 10 ** 13}}])
+        make_series_epub(self.lib / 'ren' / 'two.epub', 'Cycle Two', 'Cycle', '2')
+        resp = self.sync(token, resp['revision'], [])
+        self.assertEqual([p['value']['name'] for p in self.tag_patches(resp, 'add')],
+                         ['My Cycle'])
+
+    def test_bookmarks_from_other_readers_stay_replace(self):
+        token, _ = self.new_user('bea')
+        self.sync(token, '0', [{'op': 'add', 'path': '/publications/x/bookmark', 'value': {
+            'progress': 0.3, 'modified': 5, 'transientId': 1}}])
+        fresh = self.sync(token, '0', [])
+        ops = [p['op'] for p in fresh['patches'] if '/bookmark/' in p['path']]
+        self.assertEqual(ops, ['replace'])
+
+    def admin_collections(self, user, cookie, csrf, **form):
+        status, headers, _ = self.request(
+            'POST', self.origin + '/admin/users/%s/collections' % user,
+            headers={'Cookie': cookie}, form={'csrf': csrf, **form})
+        self.assertEqual(status, 303)
+        return urllib.parse.unquote(headers['Location'])
+
+    def test_admin_collections_reach_the_reader(self):
+        token, books = self.new_user('cleo', [('Alpha', '', ''), ('Beta', '', '')])
+        start = self.sync(token, '0', [])['revision']
+        _, cookie, csrf = self.admin_login()
+        location = self.admin_collections('cleo', cookie, csrf, action='create',
+                                          name='Favourites', uuid=books['Alpha'])
+        self.assertNotIn('err=1', location)
+        self.admin_collections('cleo', cookie, csrf, action='add', name='Favourites',
+                               uuid=books['Beta'])
+        resp = self.sync(token, start, [])
+        adds = self.tag_patches(resp, 'add')
+        self.assertEqual(sorted(p['path'].split('/')[2] for p in adds), sorted(books.values()))
+        self.assertTrue(all(p['value']['name'] == 'Favourites' for p in adds))
+        _, _, page = self.request('GET', self.origin + '/admin/users/cleo/collections',
+                                  headers={'Cookie': cookie})
+        self.assertIn(b'Favourites', page)
+        self.assertIn(b'Beta', page)
+
+        self.admin_collections('cleo', cookie, csrf, action='rename', name='Favourites',
+                               new='Best')
+        resp = self.sync(token, resp['revision'], [])
+        self.assertEqual({(p['op'], p['value']['name']) for p in self.tag_patches(resp)},
+                         {('replace', 'Best')})
+        alpha_tag = next(p['path'] for p in adds if books['Alpha'] in p['path'])
+        self.admin_collections('cleo', cookie, csrf, action='remove', key=alpha_tag)
+        resp = self.sync(token, resp['revision'], [])
+        self.assertEqual([(p['op'], p['path']) for p in self.tag_patches(resp)],
+                         [('remove', alpha_tag)])
+        self.admin_collections('cleo', cookie, csrf, action='delete', name='Best')
+        resp = self.sync(token, resp['revision'], [])
+        self.assertEqual([p['op'] for p in self.tag_patches(resp)], ['remove'])
+        _, _, page = self.request('GET', self.origin + '/admin/users/cleo/collections',
+                                  headers={'Cookie': cookie})
+        self.assertIn(b'No collections yet', page)
+
+    def test_admin_shows_series_collections_before_a_sync(self):
+        token, _ = self.new_user('sid', [('Arc One', 'Arc', '1')])
+        _, cookie, _ = self.admin_login()
+        _, _, page = self.request('GET', self.origin + '/admin/users/sid/collections',
+                                  headers={'Cookie': cookie})
+        self.assertIn(b'Arc <span class="badge">series</span>', page)
+        self.assertEqual([p['value']['name'] for p in self.tag_patches(self.sync(token, '0', []))],
+                         ['Arc'])
+
+    def test_admin_collections_reject_bad_input(self):
+        token, books = self.new_user('vic', [('Gamma', '', '')])
+        _, cookie, csrf = self.admin_login()
+        shared = self.shared_uuid('Shared Book')  # not on vic's shelf
+        for form in ({'action': 'create', 'name': 'X', 'uuid': shared},
+                     {'action': 'create', 'name': '', 'uuid': books['Gamma']},
+                     {'action': 'create', 'name': 'x' * 101, 'uuid': books['Gamma']},
+                     {'action': 'remove', 'key': '/publications/%s/bookmark' % books['Gamma']},
+                     {'action': 'explode'}):
+            self.assertIn('err=1', self.admin_collections('vic', cookie, csrf, **form), form)
+        status, headers, _ = self.request(
+            'POST', self.origin + '/admin/users/vic/collections', headers={'Cookie': cookie},
+            form={'csrf': 'bad', 'action': 'create', 'name': 'X', 'uuid': books['Gamma']})
+        self.assertIn('err=1', headers['Location'])
+        status, headers, _ = self.request(
+            'POST', self.origin + '/admin/users/vic/collections',
+            form={'csrf': csrf, 'action': 'create', 'name': 'X', 'uuid': books['Gamma']})
+        self.assertNotIn('collections', headers.get('Location', ''))  # no session: login page
+        self.assertEqual(self.tag_patches(self.sync(token, '0', [])), [])
+
+    def test_store_pages_and_finds_series(self):
+        make_series_epub(self.lib / 'shared' / 'tale1.epub', 'Tale Begins', 'Long Tale', '1')
+        make_series_epub(self.lib / 'shared' / 'tale2.epub', 'Tale Ends', 'Long Tale', '2')
+        try:
+            _, _, page = self.request('GET', '/shop?q=long+tale')
+            self.assertIn(b'Long Tale #1', page)
+            self.assertIn(b'id="next"', page)
+            self.assertLess(page.index(b'Tale Begins'), page.index(b'Tale Ends'))  # reading order
+            self.assertNotIn(b'Shared Book', page)
+        finally:
+            (self.lib / 'shared' / 'tale1.epub').unlink()
+            (self.lib / 'shared' / 'tale2.epub').unlink()
 
     def test_shop_shows_only_shared_books(self):
         status, _, body = self.request('GET', '/shop')
@@ -891,3 +1085,4 @@ class MigrationTest(unittest.TestCase):
             finally:
                 proc.terminate()
                 proc.wait()
+                proc.stdout.close()

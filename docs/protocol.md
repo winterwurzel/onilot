@@ -132,7 +132,21 @@ Response: `{"revision": "<new>", "patches": [...], "conflicts": []}`. Rules foun
 4. **Server to reader:** include `replace`/`remove` patches for documents changed after the
    reader's revision. The reader applies them and opens the book at the new position.
 
-Other document types under the same scheme: `/dogears`, `/comments`, `/tags`.
+Other document types under the same scheme: `/dogears`, `/comments`, `/tags`. These are
+lists (several documents per book, `…/tags/<id>`); the bookmark is one document per book.
+
+Collections are tags: `{"name": "…", "category": "collection", "modified": <ms>}` on
+`/publications/<uuid>/tags/<id>`, one document per book in the collection.
+
+A list document the reader has never seen (created by another reader or by the server after
+the reader's revision) is sent as `add` on `…/tags/<id>` without `transientId`; the reader's
+patch parser treats such an add as a new server document (not yet verified on a device).
+Later changes go out as `replace`, deletions as `remove`. A document created and deleted after
+the reader's revision is not sent at all. Bookmarks always go out as `replace` (verified).
+
+The inventory parser of firmware 5.18 reads only `abstract`, `authors`, `contentFormat`,
+`contentType`, `isbnEan`, `issuedDate`, `language`, `publisher`, `subtitle`, `title` and
+`uuid` from a content item; there is no field for a series name or number.
 
 ## Uploads of sideloaded books
 

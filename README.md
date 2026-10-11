@@ -21,6 +21,7 @@ yourself instead of the vendor cloud.
 | Books copied to the reader over USB are uploaded to the server automatically | ✓ |
 | Shop tab as a store for shared books (add/remove), home screen recommendations | ✓ |
 | Collections sync | ✓ |
+| Collections edited in the admin page; one collection per book series (from EPUB metadata) | needs testing on a reader |
 | Settings > account: library page with **Sync now**, device list with sign-out | ✓ |
 | Adobe DRM / vendor DRM books, audiobooks, highlights/notes sync | ✗ |
 
@@ -165,8 +166,14 @@ on a reader only affects that user. Usernames are lowercase `a-z 0-9 . _ -`.
 
 DRM-free EPUBs show up on the reader at its next sync (or "Sync now", see below). Shared
 books are not added to anyone's library automatically: the **shop tab** on the reader is a
-store for them (Add to my library / Remove), and the home screen recommends shared books the
-user has not added yet.
+store for them (Add / Remove), paged to fit the screen without scrolling, and the home screen
+recommends shared books the user has not added yet.
+
+Books with series metadata (Calibre `calibre:series` or EPUB 3 `belongs-to-collection`) get
+a collection per series on the reader, and the store and admin page show "Series #n". A
+series collection you delete or rename on the reader stays that way. Admins can also create,
+rename and delete each user's collections and add or remove books under
+**Users > (user) > Collections**; changes reach the readers at their next sync.
 
 ## On the reader
 

@@ -11,7 +11,7 @@ import urllib.parse
 from pathlib import Path
 
 from onilot.server import (ADMIN_SESSION_TTL, Library, parse_multipart_file, route,
-                           store_upload)
+                           series_label, series_of, store_upload)
 from onilot import __version__
 from onilot.users import UserError
 
@@ -106,6 +106,14 @@ dialog { border:1px solid var(--line); border-radius:var(--radius); background:v
 dialog::backdrop { background:rgba(10,14,22,.45); }
 .login { max-width:380px; margin:12vh auto; }
 .empty { text-align:center; padding:2rem; color:var(--muted); }
+select { font:inherit; padding:.45rem .6rem; border-radius:8px; border:1px solid var(--line);
+  background:var(--bg); color:var(--text); max-width:100%; }
+.members { list-style:none; margin:0 0 .8rem; padding:0; }
+.members li { display:flex; justify-content:space-between; align-items:center; gap:.6rem;
+  padding:.45rem 0; border-bottom:1px solid var(--line); }
+.members li:last-child { border-bottom:0; }
+.inline { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; }
+.inline input[type=text] { width:auto; flex:1; min-width:10rem; }
 @media (max-width:640px) { .hide-sm { display:none; } nav a { padding:.4rem .5rem; } }
 """
 
@@ -401,7 +409,8 @@ def admin_user(h, name):
         rows.append('<tr><td><b>%s</b><div class="muted small">%s</div></td><td>%s</td>'
                     '<td><div class="row"><div class="progress"><i style="width:%d%%"></i></div>'
                     '<span class="small">%d%%</span></div></td><td class="muted hide-sm">%s</td>'
-                    '</tr>' % (esc(b['title']), esc(', '.join(b['authors'])),
+                    '</tr>' % (esc(b['title']), esc(', '.join(
+                        b['authors'] + ([series_label(b)] if b['series'] else []))),
                                '<span class="badge ok">shared</span>' if b['shared'] else
                                ('<span class="badge">uploaded</span>' if ctx.is_upload(b) else ''),
                                round(pct * 100), round(pct * 100),
@@ -419,13 +428,15 @@ def admin_user(h, name):
         'value="%s"><input type=hidden name=action value=delete><button class="danger">Delete '
         'account</button></form>' % (url, esc(name), esc(h.csrf)))
     body = ('<div class="spread"><div class="who">%s<h1 style="margin:0">%s%s</h1></div>'
-            '<a class="btn" href="%s">Manage books</a></div>'
+            '<div class="row"><a class="btn" href="%s">Collections</a>'
+            '<a class="btn" href="%s">Manage books</a></div></div>'
             '<div class="stats"><div class="stat"><b>%d</b><span>own books</span></div>'
             '<div class="stat"><b>%d</b><span>readers</span></div>'
             '<div class="stat"><b>%s</b><span>last activity</span></div></div>'
             '<div class="card"><h2>Reading</h2>%s</div>'
             '<div class="card"><h2>Readers</h2>%s</div>' % (
                 avatar(name), esc(name), ' <span class="badge">admin</span>' if is_admin else '',
+                esc(h._admin_url('/users/%s/collections' % name)),
                 esc(h._admin_url('/library?owner=' + name)), len(own), len(ctx.devices), ago(last),
                 '<table><tr><th>Book</th><th></th><th>Progress</th><th class="hide-sm">Read</th>'
                 '</tr>%s</table>' % ''.join(rows) if rows else
@@ -490,7 +501,7 @@ def admin_library(h):
         initial = esc(b['title'][:1])
         cards.append(
             '<div class="book"><div class="cover">%s</div><div class="meta">'
-            '<span class="title">%s</span><span class="muted small">%s</span>'
+            '<span class="title">%s</span><span class="muted small">%s</span>%s'
             '<span class="muted small">%.1f MB</span><div class="actions">'
             '<form method=post action="%s" data-confirm="Delete %s from the server? Readers '
             'remove it at their next sync."><input type=hidden name=csrf value="%s">'
@@ -498,7 +509,9 @@ def admin_library(h):
             '</button></form></div></div></div>' % (
                 '<img src="%s" alt="%s" loading="lazy" '
                 'onerror="this.parentNode.textContent=this.alt">' % (cover_url, initial),
-                esc(b['title']), esc(', '.join(b['authors'])), b['size'] / 1e6,
+                esc(b['title']), esc(', '.join(b['authors'])),
+                '<span class="muted small"><i>%s</i></span>' % esc(series_label(b))
+                if b['series'] else '', b['size'] / 1e6,
                 esc(h._admin_url('/library/%s/%s' % (owner, b['uuid']))), esc(b['title']),
                 esc(h.csrf)))
     who = 'everyone' if owner == SHARED else owner
@@ -565,3 +578,152 @@ def admin_cover(h, owner, uuid):
         return
     h._send(200, data, mime, {'Cache-Control': 'private, max-age=3600'})
 
+
+
+# ---- collections (per user; they reach the user's readers at the next sync) -------------------
+
+NEW_COLLECTION = """<div class="card"><h2>New collection</h2>
+<form method=post action="{url}" class="inline"><input type=hidden name=csrf value="{csrf}">
+<input type=hidden name=action value=create>
+<input type=text name=name maxlength=100 required placeholder="Name">
+<select name=uuid required><option value="">First book…</option>{options}</select>
+<button class="primary">Create</button></form>
+<p class="muted small">A collection needs at least one book. Collections made on the reader
+show up here after its next sync; books with series information are collected automatically.
+</p></div>"""
+
+
+def book_options(books, exclude=()):
+    return ''.join('<option value="%s">%s</option>' % (
+        esc(b['uuid']), esc(b['title'] + (' (%s)' % series_label(b) if b['series'] else '')))
+        for b in books if b['uuid'] not in exclude)
+
+
+def collection_card(h, url, name, members, books, auto):
+    by_uuid = {b['uuid']: b for b in books}
+    csrf = '<input type=hidden name=csrf value="%s">' % esc(h.csrf)
+    hidden = csrf + '<input type=hidden name=name value="%s">' % esc(name)
+
+    def order(member):
+        book = by_uuid.get(member[1])
+        if book is None:
+            return (1, 0, '')
+        return (0, book['series_index'] or 0, book['title'].lower())
+    items = []
+    for key, uuid in sorted(members, key=order):
+        book = by_uuid.get(uuid)
+        if book is None:
+            title = '<span class="muted">Book no longer in the library</span>'
+        elif book['series']:
+            title = '%s <span class="muted small">%s</span>' % (esc(book['title']),
+                                                                esc(series_label(book)))
+        else:
+            title = esc(book['title'])
+        items.append('<li><span>%s</span><form method=post action="%s">%s'
+                     '<input type=hidden name=action value=remove>'
+                     '<input type=hidden name=key value="%s"><button class="danger small">'
+                     'Remove</button></form></li>' % (title, url, csrf, esc(key)))
+    present = {uuid for _, uuid in members}
+    options = book_options(books, present)
+    add = ('<form method=post action="%s" class="inline">%s<input type=hidden name=action '
+           'value=add><select name=uuid required><option value="">Add a book…</option>%s'
+           '</select><button>Add</button></form>' % (url, hidden, options)) if options else ''
+    return ('<div class="card"><div class="spread"><h2 style="margin:0">%s%s '
+            '<span class="muted small">%d</span></h2><div class="row">'
+            '<form method=post action="%s" class="inline">%s<input type=hidden name=action '
+            'value=rename><input type=text name=new maxlength=100 required value="%s" '
+            'aria-label="New name"><button>Rename</button></form>'
+            '<form method=post action="%s" data-confirm="Delete collection %s? The books stay '
+            'in the library.">%s<input type=hidden name=action value=delete>'
+            '<button class="danger">Delete</button></form></div></div>'
+            '<ul class="members">%s</ul>%s</div>' % (
+                esc(name), ' <span class="badge">series</span>' if auto else '', len(members),
+                url, hidden, esc(name), url, esc(name), hidden, ''.join(items), add))
+
+
+@route('GET', r'/admin/users/([a-z0-9._-]+)/collections', 'admin')
+def admin_collections(h, name):
+    if h.server.users.get(name) is None:
+        go(h, '', 'No user %s.' % name, error=True)
+        return
+    ctx = h.server.context(name)
+    books = sorted(ctx.library.books(), key=lambda b: (b['series'] or b['title'].lower(),
+                                                        b['series_index'] or 0))
+    ctx.state.update_series_collections(series_of(ctx.library))  # show them before a sync
+    collections = ctx.state.collections()
+    auto = ctx.state.auto_collections()
+    url = esc(h._admin_url('/users/%s/collections' % name))
+    cards = ''.join(collection_card(h, url, c, collections[c], books, c in auto)
+                    for c in sorted(collections, key=str.lower))
+    body = ('<div class="spread"><div class="who">%s<h1 style="margin:0">Collections of %s</h1>'
+            '</div><a class="btn" href="%s">Back to %s</a></div>%s%s' % (
+                avatar(name), esc(name), esc(h._admin_url('/users/' + name)), esc(name),
+                NEW_COLLECTION.format(url=url, csrf=esc(h.csrf), options=book_options(books)),
+                cards or '<div class="card empty">No collections yet.</div>'))
+    page(h, 'Collections', body)
+
+
+@route('POST', r'/admin/users/([a-z0-9._-]+)/collections', 'admin')
+def admin_collection_action(h, name):
+    form = h._form()
+    path = '/users/%s/collections' % name
+    if not csrf_ok(h, form):
+        go(h, path, 'Form expired, please try again.', error=True)
+        return
+    if h.server.users.get(name) is None:
+        go(h, '', 'No user %s.' % name, error=True)
+        return
+    handler = COLLECTION_ACTIONS.get(form.get('action'))
+    if handler is None:
+        go(h, path, 'Unknown request.', error=True)
+        return
+    try:
+        message = handler(h.server.context(name), form)
+    except UserError as exc:
+        go(h, path, str(exc), error=True)
+        return
+    go(h, path, message)
+
+
+def collection_name(form, field='name'):
+    value = (form.get(field) or '').strip()
+    if not 0 < len(value) <= 100:
+        raise UserError('Collection names need 1 to 100 characters.')
+    return value
+
+
+def collection_add(ctx, form):
+    collection = collection_name(form)
+    book = ctx.library.find(form.get('uuid', ''))
+    if book is None:
+        raise UserError('Pick a book from %s\'s library.' % ctx.name)
+    ctx.state.add_to_collection(collection, book['uuid'])
+    return 'Added "%s" to %s.' % (book['title'], collection)
+
+
+def collection_rename(ctx, form):
+    old, new = collection_name(form), collection_name(form, 'new')
+    if new != old and new in ctx.state.collections():
+        raise UserError('There already is a collection called %s.' % new)
+    ctx.state.rename_collection(old, new)
+    return 'Renamed %s to %s.' % (old, new)
+
+
+def collection_delete(ctx, form):
+    collection = collection_name(form)
+    for key, _ in ctx.state.collections().get(collection, []):
+        ctx.state.remove_tag(key)
+    return 'Deleted collection %s.' % collection
+
+
+def collection_remove(ctx, form):
+    key = form.get('key', '')
+    if not any(key == k for members in ctx.state.collections().values() for k, _ in members):
+        raise UserError('That book is not in a collection.')
+    ctx.state.remove_tag(key)
+    return 'Removed the book from the collection.'
+
+
+COLLECTION_ACTIONS = {'create': collection_add, 'add': collection_add,
+                      'rename': collection_rename, 'delete': collection_delete,
+                      'remove': collection_remove}
