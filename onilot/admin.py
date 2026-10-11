@@ -385,6 +385,10 @@ USER_ACTIONS = """<div class="card"><h2>Account</h2><div class="row">
 <form method=post action="{url}" data-confirm="Sign out all readers of {name}? They have to sign in again.">
 <input type=hidden name=csrf value="{csrf}"><input type=hidden name=action value=signout>
 <button>Sign out readers</button></form>
+<form method=post action="{url}" title="Brings back positions, finished marks and collections that
+were removed by deleting books on a reader, for the books now in the library.">
+<input type=hidden name=csrf value="{csrf}"><input type=hidden name=action value=restore>
+<button>Restore reading data</button></form>
 {delete}</div></div>
 <dialog id="pw"><h2>New password for {name}</h2>
 <form method=post action="{url}"><input type=hidden name=csrf value="{csrf}">
@@ -474,6 +478,11 @@ def admin_user_action(h, name):
         elif action == 'admin':
             users.set_admin(name, form.get('state') == 'on')
             go(h, path, 'Updated %s.' % name)
+        elif action == 'restore':
+            ctx = h.server.context(name)
+            count = ctx.state.restore([b['uuid'] for b in ctx.library.books()])
+            go(h, path, 'Restored %d reading data entries; readers get them at their next '
+                        'sync.' % count)
         elif action == 'signout':
             h.server.sign_out(name)
             go(h, path, 'Signed out all readers of %s.' % name)

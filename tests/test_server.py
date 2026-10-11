@@ -882,6 +882,34 @@ class DeviceFlowTest(unittest.TestCase):
         self.assertTrue({'uuid': books['Own One']} in inv['deletedContent'])
         self.assertTrue((self.lib / 'del' / '.deleted' / '0.epub').exists())  # recoverable
 
+    def test_readding_a_book_restores_its_reading_data(self):
+        token, books = self.new_user('back', [('Kept Book', '', '')])
+        shared = self.shared_uuid('Shared Book')
+        self.store_add(token, shared)
+        own = books['Kept Book']
+        resp = self.sync(token, '0', [
+            {'op': 'add', 'path': '/publications/%s/bookmark' % u, 'value': {
+                'progress': 0.4, 'modified': 5, 'transientId': i}} for i, u in
+            enumerate((shared, own))])
+        paths = [p['path'] for p in resp['patches'] if '/bookmark/' in p['path']]
+        # deleting on the reader: book removal plus removal of its reading data
+        resp = self.sync(token, resp['revision'], [{'op': 'remove', 'path': p} for p in paths])
+        self.request('DELETE', '/v1/inventory', body=json.dumps([shared]).encode(),
+                     headers=self.auth(token))
+        self.store_add(token, shared)                               # back via the store
+        resp = self.sync(token, resp['revision'], [])
+        self.assertEqual([(p['op'], p['value']['progress']) for p in resp['patches']
+                          if shared in p['path']], [('replace', 0.4)])
+        # the own book: restored from the admin page
+        _, cookie, csrf = self.admin_login()
+        _, headers, _ = self.request('POST', self.origin + '/admin/users/back',
+                                     headers={'Cookie': cookie},
+                                     form={'csrf': csrf, 'action': 'restore'})
+        self.assertIn('Restored 1', urllib.parse.unquote(headers['Location']))
+        resp = self.sync(token, resp['revision'], [])
+        self.assertEqual([p['value']['progress'] for p in resp['patches'] if own in p['path']],
+                         [0.4])
+
     def test_store_pages_and_finds_series(self):
         make_series_epub(self.lib / 'shared' / 'tale1.epub', 'Tale Begins', 'Long Tale', '1')
         make_series_epub(self.lib / 'shared' / 'tale2.epub', 'Tale Ends', 'Long Tale', '2')

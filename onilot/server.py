@@ -347,6 +347,27 @@ class State:
                     result.setdefault(value['name'], []).append((key, parts[2]))
         return result
 
+    def restore(self, uuids):
+        """Undo the reader's removal of position, notes and tags of these books.
+
+        Deleting a book on the reader also removes its reading data there, and the reader
+        sends those removals. The documents stay here (marked deleted), so when the book comes
+        back they can be revived: the reader gets them like data from another reader.
+        Returns the number of revived documents.
+        """
+        prefixes = tuple('/publications/%s/' % u for u in uuids)
+        count = 0
+        with self.lock:
+            for key, doc in self.docs.items():
+                if doc.get('deleted') and (key + '/').startswith(prefixes):
+                    self.revision += 1
+                    doc.update(deleted=False, book_gone=False, revision=self.revision,
+                               created=self.revision)
+                    count += 1
+            if count:
+                self._save()
+        return count
+
     def finished(self):
         """uuids of books marked as finished on a reader (a system tag, not the progress)."""
         with self.lock:
@@ -1521,6 +1542,7 @@ class UserContext:
             self.shelf[uuid] = int(time.time() * 1000)
             self.shelf_path.write_text(json.dumps(self.shelf, indent=1))
         self.server.clear_deletion(self.name, uuid)
+        self.state.restore([uuid])   # position and collections from before a delete
 
     def remove_from_shelf(self, uuid):
         with self.lock:
