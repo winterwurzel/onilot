@@ -89,6 +89,8 @@ the shop tab. Relevant keys:
   `renderingEngine` `FGRE`/`READIUM_1`; author `type` `AUTHOR`/`READER`/`COMPOSER`.
 - The cover `resource` URL gets `?size=WS-B04` appended by the reader and is stored
   permanently. Keep signatures in the path and don't let cover URLs expire.
+- SVG covers work (the firmware ships Qt's SVG image plugin); onilot uses that for
+  generated covers of books without any image.
 
 ## Download
 
