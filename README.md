@@ -6,7 +6,7 @@ yourself instead of the vendor cloud.
 
 *onilot* is "tolino" backwards.
 
-> **Status: experimental, single user.** Verified on a Tolino Vision Color with firmware
+> **Status: experimental.** Verified on a Tolino Vision Color with firmware
 > 5.18.264769. Other 5.x devices (Shine 5 / Shine Color) run the same software and will
 > probably work, but are untested.
 
@@ -14,7 +14,8 @@ yourself instead of the vendor cloud.
 
 | Feature | |
 |---|---|
-| Setup and sign-in on the reader (password page on your server) | ✓ |
+| Setup and sign-in on the reader (login page on your server) | ✓ |
+| Multiple users: own books, reading progress, collections and readers per user; shared books for everyone | ✓ |
 | Library sync, covers, book download | ✓ |
 | Reading position sync, both directions, last write wins | ✓ |
 | Books copied to the reader over USB are uploaded to the server automatically | ✓ |
@@ -43,6 +44,7 @@ The protocol the reader speaks is documented in [docs/protocol.md](docs/protocol
 docker run -d --name onilot --restart unless-stopped \
   -p 8095:8095 \
   -e ONILOT_PUBLIC_URL=https://books.example.com/onilot \
+  -e ONILOT_ADMIN_USER=anna \
   -e ONILOT_PASSWORD='choose-a-password' \
   -v /srv/books:/library \
   -v /srv/onilot-data:/data \
@@ -59,10 +61,11 @@ services:
     ports: ["8095:8095"]
     environment:
       ONILOT_PUBLIC_URL: https://books.example.com/onilot
+      ONILOT_ADMIN_USER: anna          # first admin, created on first start
       ONILOT_PASSWORD: choose-a-password
     volumes:
-      - /srv/books:/library        # your EPUBs; uploads from the reader land here too
-      - /srv/onilot-data:/data     # reading positions, tokens, signing key
+      - /srv/books:/library        # books: /srv/books/<user>/ and /srv/books/shared/
+      - /srv/onilot-data:/data     # users, reading positions, tokens, signing key
 ```
 
 The container runs as UID 1000; make the volumes writable for it.
@@ -119,7 +122,7 @@ The reader must run firmware 5.x in **Tolino mode** (Tolino branding).
    automatic firmware updates, which would replace the patched file.
 3. Eject and restart the reader.
 4. Sign in to your Tolino account on the reader (setup wizard or account settings). Pick
-   the country, and your login page appears. Enter `ONILOT_PASSWORD`.
+   the country, and your login page appears. Enter your onilot user name and password.
 
 Your library syncs, books download on tap, and positions sync from then on.
 
@@ -128,18 +131,55 @@ Your library syncs, books download on tap, and positions sync from then on.
 Copy `out/Kobo-restore.tgz` to `.kobo/` as `Kobo.tgz` (or just set
 `pref_is_prod_env_enabled=true`) and restart. A firmware update also restores the original.
 
+## Users
+
+`ONILOT_ADMIN_USER` + `ONILOT_PASSWORD` create the first admin on the first start (after that
+`ONILOT_PASSWORD` is ignored). Add more users on the command line:
+
+```sh
+docker exec -it onilot python -m onilot user add bob          # asks for the password
+docker exec -it onilot python -m onilot user add carol --admin
+docker exec onilot python -m onilot user list
+docker exec -it onilot python -m onilot user passwd bob
+docker exec onilot python -m onilot user remove bob             # books and progress are kept
+```
+
+or in the browser at `ONILOT_PUBLIC_URL/admin` (admins only): add users, set passwords,
+grant admin, delete. Changing a password signs that user's readers out.
+
+Each user has their own books, reading progress, collections and list of readers; "sign out"
+on a reader only affects that user. Usernames are lowercase `a-z 0-9 . _ -`.
+
 ## Adding books
 
-Put DRM-free EPUBs into the library volume. They show up on the reader at its next sync.
-Books you copy onto the reader over USB are uploaded to the server automatically.
+| Directory (in the library volume) | Visible to |
+|---|---|
+| `<user>/` | that user only; books copied onto their reader over USB are uploaded here |
+| `shared/` | everyone |
+
+DRM-free EPUBs show up on the reader at its next sync (or "Sync now", see below). The shop
+tab on the reader has no login, so it only lists shared books.
+
+## On the reader
+
+- **Settings > account > Link Library** shows your books and has a **Sync now** button.
+- **Settings > account > Device Management** lists your readers and can sign them all out.
+
+## Upgrading from a single-user version
+
+Set `ONILOT_ADMIN_USER` (e.g. to your name) next to the existing `ONILOT_PASSWORD` and
+restart. On that first start onilot creates the admin and moves the existing reading progress,
+tokens, devices, uploads and books (`library/*.epub` to `library/<name>/`) to it. Readers stay
+signed in, and cover URLs they stored keep working.
 
 ## Configuration
 
 | Variable | Default | |
 |---|---|---|
 | `ONILOT_PUBLIC_URL` | (required) | the exact URL the reader was patched to |
-| `ONILOT_PASSWORD` | (required) | password for the login page on the reader |
-| `ONILOT_LIBRARY` | `/library` (image) | EPUB directory |
+| `ONILOT_ADMIN_USER` | `admin` | first admin, created on first start |
+| `ONILOT_PASSWORD` | (first start) | password of that first admin |
+| `ONILOT_LIBRARY` | `/library` (image) | books: `<user>/` and `shared/` |
 | `ONILOT_DATA` | `/data` (image) | state directory |
 | `ONILOT_PORT` / `ONILOT_BIND` | `8095` / `0.0.0.0` (image) | listen address |
 | `ONILOT_BRAND` | `onilot` | name shown on the reader |
@@ -150,10 +190,12 @@ Without Docker: `python3 -m onilot` (Python 3.10+, no dependencies).
 
 ## Security notes
 
-- Single user: everyone who knows `ONILOT_PASSWORD` gets the whole library. Use a strong one.
+- Passwords are stored as PBKDF2-SHA256 hashes; failed logins are slowed down.
+- The admin page uses an HttpOnly, SameSite=Strict session cookie (Secure on https) and a
+  CSRF token in every form.
 - Library and progress endpoints require an access token issued after login. Book and
-  cover URLs are HMAC-signed capability URLs (the reader sends no token for downloads);
-  book links expire after 24 h.
+  cover URLs are HMAC-signed capability URLs bound to the user (the reader sends no token
+  for downloads); book links expire after 24 h.
 - Developer mode on the reader can start telnet/FTP servers without a password. Don't
   leave it on longer than needed.
 

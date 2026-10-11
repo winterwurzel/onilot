@@ -1,3 +1,3 @@
-from onilot.server import main
+from onilot.server import entry
 
-main()
+entry()

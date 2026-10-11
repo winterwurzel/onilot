@@ -18,13 +18,14 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-SERVER = Path(__file__).resolve().parent.parent / 'onilot' / 'server.py'
+REPO = Path(__file__).resolve().parent.parent
 PASSWORD = 'test-password'
+BOB_PASSWORD = 'bob-password'
 
 OPF = """<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <dc:identifier id="id">test-book</dc:identifier><dc:title>Test Book</dc:title>
+  <dc:identifier id="id">test-book</dc:identifier><dc:title>{title}</dc:title>
   <dc:creator>Jane Author</dc:creator><dc:language>de</dc:language>
  </metadata>
  <manifest><item id="c" href="cover.jpg" media-type="image/jpeg" properties="cover-image"/>
@@ -35,11 +36,11 @@ CONTAINER = """<?xml version="1.0"?>
   media-type="application/oebps-package+xml"/></rootfiles></container>"""
 
 
-def make_epub(path):
+def make_epub(path, title='Test Book'):
     with zipfile.ZipFile(path, 'w') as z:
         z.writestr('mimetype', 'application/epub+zip')
         z.writestr('META-INF/container.xml', CONTAINER)
-        z.writestr('OEBPS/content.opf', OPF)
+        z.writestr('OEBPS/content.opf', OPF.replace('{title}', title))
         z.writestr('OEBPS/cover.jpg', b'\xff\xd8fakejpeg')
 
 
@@ -48,29 +49,52 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def free_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def start_server(base, port, lib, data, extra_env=None):
+    clean = {k: v for k, v in os.environ.items() if not k.startswith('ONILOT_')}
+    proc = subprocess.Popen(
+        [sys.executable, '-m', 'onilot'], cwd=str(REPO),
+        env={**clean, 'ONILOT_PUBLIC_URL': base, 'ONILOT_LIBRARY': str(lib),
+             'ONILOT_DATA': str(data), 'ONILOT_PORT': str(port), 'ONILOT_REQUEST_LOG': '1',
+             **(extra_env or {})},
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for _ in range(100):
+        try:
+            urllib.request.urlopen(base + '/online-check')
+            return proc
+        except OSError:
+            time.sleep(0.1)
+    proc.terminate()
+    raise RuntimeError('server did not start: %s' % proc.communicate()[0].decode())
+
+
+def user_cli(data, *args, stdin=None):
+    clean = {k: v for k, v in os.environ.items() if not k.startswith('ONILOT_')}
+    return subprocess.run([sys.executable, '-m', 'onilot', 'user', *args], cwd=str(REPO),
+                          env={**clean, 'ONILOT_DATA': str(data)}, input=stdin,
+                          capture_output=True, text=True, timeout=60)
+
+
 class DeviceFlowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        lib = Path(cls.tmp.name, 'library')
-        lib.mkdir()
-        make_epub(lib / 'test.epub')
-        with socket.socket() as s:
-            s.bind(('127.0.0.1', 0))
-            port = s.getsockname()[1]
+        cls.lib = Path(cls.tmp.name, 'library')
+        cls.data = Path(cls.tmp.name, 'data')
+        (cls.lib / 'shared').mkdir(parents=True)
+        make_epub(cls.lib / 'test.epub')                     # first start moves it to alice
+        make_epub(cls.lib / 'shared' / 'shared.epub', 'Shared Book')
+        port = free_port()
         cls.base = 'http://127.0.0.1:%d/onilotapi' % port
-        cls.proc = subprocess.Popen(
-            [sys.executable, '-I', str(SERVER)],
-            env={**os.environ, 'ONILOT_PASSWORD': PASSWORD, 'ONILOT_PUBLIC_URL': cls.base,
-                 'ONILOT_LIBRARY': str(lib), 'ONILOT_DATA': str(Path(cls.tmp.name, 'data')),
-                 'ONILOT_PORT': str(port), 'ONILOT_REQUEST_LOG': '1'},
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        for _ in range(50):
-            try:
-                urllib.request.urlopen(cls.base + '/online-check')
-                break
-            except OSError:
-                time.sleep(0.1)
+        cls.proc = start_server(cls.base, port, cls.lib, cls.data, {
+            'ONILOT_ADMIN_USER': 'alice', 'ONILOT_PASSWORD': PASSWORD})
+        result = user_cli(cls.data, 'add', 'bob', '--password-stdin', stdin=BOB_PASSWORD + '\n')
+        assert result.returncode == 0, result.stderr
         cls.opener = urllib.request.build_opener(NoRedirect)
 
     @classmethod
@@ -89,9 +113,9 @@ class DeviceFlowTest(unittest.TestCase):
         except urllib.error.HTTPError as err:
             return err.code, dict(err.headers), err.read()
 
-    def login(self):
+    def login(self, user='alice', password=PASSWORD):
         status, headers, _ = self.request('POST', '/oauth/authorize',
-                                          form={'password': PASSWORD})
+                                          form={'username': user, 'password': password})
         self.assertEqual(status, 302)
         code = urllib.parse.parse_qs(urllib.parse.urlsplit(headers['Location']).query)['code'][0]
         self.assertTrue(headers['Location'].startswith('epublishing://login?code='))
@@ -112,17 +136,19 @@ class DeviceFlowTest(unittest.TestCase):
         self.assertIn('?', config['URL_OAUTH_AUTHORIZATION'])  # device appends &client_id=
 
     def test_wrong_password_gets_no_code(self):
-        status, headers, body = self.request('POST', '/oauth/authorize',
-                                             form={'password': 'nope'})
-        self.assertEqual(status, 200)
-        self.assertNotIn('Location', headers)
-        self.assertIn(b'Wrong password', body)
+        for form in ({'username': 'alice', 'password': 'nope'},
+                     {'username': 'nobody', 'password': PASSWORD},
+                     {'password': PASSWORD}):
+            status, headers, body = self.request('POST', '/oauth/authorize', form=form)
+            self.assertEqual(status, 200)
+            self.assertNotIn('Location', headers)
+            self.assertIn(b'Wrong user or password', body)
 
     def test_access_token_payload_has_sub(self):
         tokens, _ = self.login()
         payload = tokens['access_token'].split('.')[1]
         payload += '=' * (-len(payload) % 4)
-        self.assertEqual(json.loads(base64.urlsafe_b64decode(payload))['sub'], 'user1')
+        self.assertEqual(json.loads(base64.urlsafe_b64decode(payload))['sub'], 'alice')
 
     def test_login_code_is_single_use(self):
         _, code = self.login()
@@ -147,8 +173,9 @@ class DeviceFlowTest(unittest.TestCase):
                                        headers=self.auth(tokens['access_token']))
         self.assertEqual(status, 200)
         inventory = json.loads(body)
-        item = inventory['page']['content'][0]
-        self.assertEqual(inventory['page']['numberOfElements'], 1)
+        item = next(i for i in inventory['page']['content'] if i['title'] == 'Test Book')
+        self.assertEqual(inventory['page']['numberOfElements'],
+                         len(inventory['page']['content']))
         self.assertEqual(item['title'], 'Test Book')
         self.assertEqual(item['authors'][0]['name'], 'Jane Author')
 
@@ -258,7 +285,7 @@ class DeviceFlowTest(unittest.TestCase):
         # an older write from another client must not overwrite the newer position
         other = self.sync(tokens['access_token'], '0', [{'op': 'replace', 'path': full,
                           'value': {'position': 'stale', 'modified': 150}}])
-        doc = Path(self.tmp.name, 'data', 'reading-metadata.json').read_text()
+        doc = Path(self.tmp.name, 'data', 'users', 'alice', 'reading-metadata.json').read_text()
         self.assertIn('"new"', doc)
         self.assertNotIn('"stale"', doc)
         del other
@@ -311,11 +338,11 @@ class DeviceFlowTest(unittest.TestCase):
         self.assertEqual(meta['title'], 'Test Book')
         self.assertEqual(meta['format'], 'application/epub+zip')
         self.assertEqual(meta['authors'], 'Jane Author')
-        self.assertTrue(Path(self.tmp.name, 'library', 'my-book.epub').exists())
+        self.assertTrue(Path(self.tmp.name, 'library', 'alice', 'my-book.epub').exists())
         # same upload again: no duplicate file, same uuid
         _, _, body2 = self.upload(tokens['access_token'], 'my-book.epub.epub', epub.read_bytes())
         self.assertEqual(json.loads(body2)['metadata']['inventoryUuid'], meta['inventoryUuid'])
-        self.assertFalse(Path(self.tmp.name, 'library', 'my-book-2.epub').exists())
+        self.assertFalse(Path(self.tmp.name, 'library', 'alice', 'my-book-2.epub').exists())
         _, _, inv = self.request('GET', '/v8/inventory', headers=self.auth(tokens['access_token']))
         items = {i['uuid']: i for i in json.loads(inv)['page']['content']}
         self.assertEqual(items[meta['inventoryUuid']]['contentSources'], ['USER_UPLOAD'])
@@ -353,7 +380,7 @@ class DeviceFlowTest(unittest.TestCase):
         first = echoes[0]['path']
         resp = self.sync(tokens['access_token'], resp['revision'],
                          [{'op': 'remove', 'path': first}])
-        doc = json.loads(Path(self.tmp.name, 'data', 'reading-metadata.json').read_text())
+        doc = json.loads(Path(self.tmp.name, 'data', 'users', 'alice', 'reading-metadata.json').read_text())
         self.assertTrue(doc['docs'][first]['deleted'])
         self.assertEqual(sum(1 for k, v in doc['docs'].items()
                              if k.startswith(path + '/') and not v['deleted']), 1)
@@ -395,6 +422,162 @@ class DeviceFlowTest(unittest.TestCase):
         form = {'refresh_token': tokens['refresh_token'], 'grant_type': 'refresh_token'}
         self.assertEqual(self.request('POST', '/oauth/token', form=form)[0], 400)
 
+
+    # ---- multi-user ------------------------------------------------------------------------
+
+    def inventory_titles(self, token):
+        _, _, body = self.request('GET', '/v8/inventory', headers=self.auth(token))
+        return {i['title']: i for i in json.loads(body)['page']['content']}
+
+    def test_users_see_own_and_shared_books_only(self):
+        alice, _ = self.login()
+        bob, _ = self.login('bob', BOB_PASSWORD)
+        self.assertEqual(set(self.inventory_titles(alice['access_token'])) & {'Test Book',
+                         'Shared Book'}, {'Test Book', 'Shared Book'})
+        self.assertNotIn('Test Book', self.inventory_titles(bob['access_token']))
+        self.assertIn('Shared Book', self.inventory_titles(bob['access_token']))
+
+    def test_access_token_names_the_user(self):
+        bob, _ = self.login('bob', BOB_PASSWORD)
+        payload = bob['access_token'].split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        self.assertEqual(json.loads(base64.urlsafe_b64decode(payload))['sub'], 'bob')
+
+    def test_reading_progress_is_per_user(self):
+        alice, _ = self.login()
+        bob, _ = self.login('bob', BOB_PASSWORD)
+        path = '/publications/per-user-book/bookmark'
+        self.sync(alice['access_token'], '0', [{'op': 'add', 'path': path, 'value': {
+            'position': 'alice-pos', 'modified': 10, 'transientId': 1}}])
+        resp = self.sync(bob['access_token'], '0', [])
+        self.assertFalse([p for p in resp['patches'] if p['path'].startswith(path)])
+        bob_file = self.data / 'users' / 'bob' / 'reading-metadata.json'
+        self.assertNotIn('alice-pos', bob_file.read_text() if bob_file.exists() else '')
+
+    def test_book_links_are_bound_to_the_user(self):
+        alice, _ = self.login()
+        bob, _ = self.login('bob', BOB_PASSWORD)
+        uuid = self.inventory_titles(alice['access_token'])['Test Book']['uuid']
+        _, _, body = self.request('GET', '/v1/inventory/%s/downloadinfo' % uuid,
+                                  headers=self.auth(alice['access_token']))
+        url = json.loads(body)['contentUrl']
+        self.assertIn('/content/alice/', url)
+        self.assertEqual(self.request('GET', url)[0], 200)
+        self.assertEqual(self.request('GET', url.replace('/content/alice/', '/content/bob/'))[0],
+                         403)
+        # bob cannot fetch alice's book through his own token either
+        self.assertEqual(self.request('GET', '/v1/inventory/%s/downloadinfo' % uuid,
+                                      headers=self.auth(bob['access_token']))[0], 404)
+
+    def test_uploads_go_to_the_uploaders_directory(self):
+        bob, _ = self.login('bob', BOB_PASSWORD)
+        epub = Path(self.tmp.name, 'bob-up.epub')
+        make_epub(epub, 'Bob Upload')
+        status, _, _ = self.upload(bob['access_token'], 'bobs.epub', epub.read_bytes())
+        self.assertEqual(status, 200)
+        self.assertTrue((self.lib / 'bob' / 'bobs.epub').exists())
+        alice, _ = self.login()
+        self.assertNotIn('Bob Upload', self.inventory_titles(alice['access_token']))
+
+    def test_shop_shows_only_shared_books(self):
+        status, _, body = self.request('GET', '/shop')
+        self.assertEqual(status, 200)
+        self.assertIn(b'Shared Book', body)
+        self.assertNotIn(b'Test Book', body)
+
+    def test_sign_out_only_affects_own_readers(self):
+        alice, _ = self.login()
+        bob, _ = self.login('bob', BOB_PASSWORD)
+        self.request('POST', '/onilot/devices/sign-out', body=b'',
+                     headers=self.auth(bob['access_token']))
+        self.assertEqual(self.request('GET', '/v8/inventory',
+                                      headers=self.auth(bob['access_token']))[0], 401)
+        self.assertEqual(self.request('GET', '/v8/inventory',
+                                      headers=self.auth(alice['access_token']))[0], 200)
+
+    def test_user_removed_via_cli_loses_access_immediately(self):
+        self.assertEqual(user_cli(self.data, 'add', 'gone', '--password-stdin',
+                                  stdin='gone-password\n').returncode, 0)
+        tokens, _ = self.login('gone', 'gone-password')
+        self.assertEqual(self.request('GET', '/v8/inventory',
+                                      headers=self.auth(tokens['access_token']))[0], 200)
+        self.assertEqual(user_cli(self.data, 'remove', 'gone').returncode, 0)
+        self.assertEqual(self.request('GET', '/v8/inventory',
+                                      headers=self.auth(tokens['access_token']))[0], 401)
+        form = {'refresh_token': tokens['refresh_token'], 'grant_type': 'refresh_token'}
+        self.assertEqual(self.request('POST', '/oauth/token', form=form)[0], 400)
+
+    # ---- admin page --------------------------------------------------------------------------
+
+    def admin_login(self, user='alice', password=PASSWORD):
+        status, headers, _ = self.request('POST', '/admin/login',
+                                          form={'username': user, 'password': password})
+        if status != 303:
+            return status, None, None
+        cookie = headers['Set-Cookie'].split(';')[0]
+        _, _, page = self.request('GET', '/admin', headers={'Cookie': cookie})
+        csrf = page.decode().split('name=csrf value="')[1].split('"')[0]
+        return status, cookie, csrf
+
+    def test_admin_login_requires_admin(self):
+        status, _, _ = self.admin_login('bob', BOB_PASSWORD)
+        self.assertEqual(status, 403)
+        status, _, _ = self.admin_login('alice', 'wrong')
+        self.assertEqual(status, 403)
+        status, cookie, csrf = self.admin_login()
+        self.assertEqual(status, 303)
+        self.assertTrue(cookie.startswith('onilot_admin='))
+
+    def test_admin_cookie_flags(self):
+        status, headers, _ = self.request('POST', '/admin/login',
+                                          form={'username': 'alice', 'password': PASSWORD})
+        flags = headers['Set-Cookie']
+        self.assertIn('HttpOnly', flags)
+        self.assertIn('SameSite=Strict', flags)
+
+    def test_admin_actions_need_session_and_csrf(self):
+        form = {'action': 'add', 'name': 'mallory', 'password': 'mallory-pw'}
+        status, headers, _ = self.request('POST', '/admin/users', form=form)
+        self.assertEqual(status, 303)  # redirected to the login page
+        self.assertNotIn('mallory', user_cli(self.data, 'list').stdout)
+        _, cookie, csrf = self.admin_login()
+        status, _, _ = self.request('POST', '/admin/users', form={**form, 'csrf': 'bad'},
+                                    headers={'Cookie': cookie})
+        self.assertEqual(status, 403)
+        self.assertNotIn('mallory', user_cli(self.data, 'list').stdout)
+
+    def test_admin_add_reset_and_delete_user(self):
+        _, cookie, csrf = self.admin_login()
+        h = {'Cookie': cookie}
+        self.request('POST', '/admin/users', headers=h, form={
+            'csrf': csrf, 'action': 'add', 'name': 'carol', 'password': 'carol-pass'})
+        carol, _ = self.login('carol', 'carol-pass')
+        self.request('POST', '/admin/users', headers=h, form={
+            'csrf': csrf, 'action': 'passwd', 'name': 'carol', 'password': 'carol-new-pass'})
+        # password change signs carol's readers out
+        self.assertEqual(self.request('GET', '/v8/inventory',
+                                      headers=self.auth(carol['access_token']))[0], 401)
+        self.login('carol', 'carol-new-pass')
+        status, headers, _ = self.request('POST', '/admin/users', headers=h, form={
+            'csrf': csrf, 'action': 'remove', 'name': 'carol'})
+        self.assertIn('Deleted', urllib.parse.unquote(headers['Location']))
+        status, _, body = self.request('POST', '/oauth/authorize',
+                                       form={'username': 'carol', 'password': 'carol-new-pass'})
+        self.assertIn(b'Wrong user or password', body)
+        # an admin cannot delete themselves
+        _, headers, _ = self.request('POST', '/admin/users', headers=h, form={
+            'csrf': csrf, 'action': 'remove', 'name': 'alice'})
+        self.assertIn('err=1', headers['Location'])
+
+    def test_admin_rejects_bad_user_names(self):
+        _, cookie, csrf = self.admin_login()
+        for name in ('../etc', 'shared', 'with space', 'a/b', ''):
+            _, headers, _ = self.request('POST', '/admin/users', headers={'Cookie': cookie},
+                                         form={'csrf': csrf, 'action': 'add', 'name': name,
+                                               'password': 'long-enough'})
+            self.assertIn('err=1', headers['Location'], name)
+        self.assertFalse(Path(self.tmp.name, 'etc').exists())
+
     def test_log_contains_no_password_or_tokens(self):
         tokens, _ = self.login()
         log = Path(self.tmp.name, 'data', 'requests.jsonl').read_text()
@@ -415,8 +598,11 @@ if __name__ == '__main__':
 class ConfigTest(unittest.TestCase):
     def run_server(self, env):
         clean = {k: v for k, v in os.environ.items() if not k.startswith('ONILOT_')}
-        return subprocess.run([sys.executable, '-I', str(SERVER)], env={**clean, **env},
-                              capture_output=True, text=True, timeout=10)
+        with tempfile.TemporaryDirectory() as tmp:
+            return subprocess.run([sys.executable, '-m', 'onilot'], cwd=str(REPO),
+                                  env={**clean, 'ONILOT_DATA': tmp + '/data',
+                                       'ONILOT_LIBRARY': tmp + '/lib', **env},
+                                  capture_output=True, text=True, timeout=30)
 
     def test_refuses_to_start_without_public_url_or_password(self):
         result = self.run_server({'ONILOT_PASSWORD': 'x'})
@@ -429,3 +615,73 @@ class ConfigTest(unittest.TestCase):
     def test_rejects_malformed_public_url(self):
         result = self.run_server({'ONILOT_PASSWORD': 'x', 'ONILOT_PUBLIC_URL': 'books.example/'})
         self.assertNotEqual(result.returncode, 0)
+
+
+class UserCliTest(unittest.TestCase):
+    def test_add_list_passwd_remove(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(user_cli(tmp, 'add', 'dora', '--admin', '--password-stdin',
+                                      stdin='dora-password\n').returncode, 0)
+            self.assertEqual(user_cli(tmp, 'add', 'ed', '--password-stdin',
+                                      stdin='ed-password\n').returncode, 0)
+            self.assertEqual(user_cli(tmp, 'list').stdout.split(), ['dora', '(admin)', 'ed'])
+            short = user_cli(tmp, 'add', 'fay', '--password-stdin', stdin='short\n')
+            self.assertNotEqual(short.returncode, 0)
+            self.assertIn('at least', short.stderr)
+            last = user_cli(tmp, 'remove', 'dora')
+            self.assertNotEqual(last.returncode, 0)
+            self.assertIn('last admin', last.stderr)
+            self.assertEqual(user_cli(tmp, 'passwd', 'ed', '--password-stdin',
+                                      stdin='ed-new-password\n').returncode, 0)
+            self.assertEqual(user_cli(tmp, 'remove', 'ed').returncode, 0)
+            stored = json.loads(Path(tmp, 'users.json').read_text())
+            self.assertTrue(stored['users']['dora']['password'].startswith('pbkdf2_sha256$'))
+            self.assertNotIn('dora-password', Path(tmp, 'users.json').read_text())
+
+
+class MigrationTest(unittest.TestCase):
+    """A single-user install (pre multi-user) keeps working after the upgrade."""
+
+    def test_single_user_data_moves_to_first_admin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib, data = Path(tmp, 'library'), Path(tmp, 'data')
+            lib.mkdir()
+            data.mkdir()
+            make_epub(lib / 'old.epub', 'Old Book')
+            (data / 'reading-metadata.json').write_text(json.dumps({
+                'revision': 3, 'next_id': 2, 'docs': {'/publications/x/bookmark': {
+                    'id': 1, 'revision': 3, 'value': {'position': 'old'}, 'deleted': False}}}))
+            (data / 'uploads.json').write_text(json.dumps(['old.epub']))
+            old_token = 'aaaaaaaaaa.bbbbbbbbbb.cccccccccc'
+            (data / 'tokens.json').write_text(json.dumps({
+                'refresh': ['old-refresh'], 'access': {old_token: time.time() + 3600}}))
+            key = b'k' * 32
+            (data / 'url-signing.key').write_bytes(key)
+            import hashlib
+            import hmac as hmac_mod
+            uuid = hashlib.sha1(b'old.epub').hexdigest()
+            sig = hmac_mod.new(key, ('covers:%s:4102444800' % uuid).encode(),
+                               hashlib.sha256).hexdigest()
+            port = free_port()
+            base = 'http://127.0.0.1:%d/api' % port
+            proc = start_server(base, port, lib, data, {'ONILOT_ADMIN_USER': 'winter',
+                                                        'ONILOT_PASSWORD': PASSWORD})
+            try:
+                self.assertTrue((lib / 'winter' / 'old.epub').exists())
+                self.assertTrue((data / 'users' / 'winter' / 'reading-metadata.json').exists())
+                req = urllib.request.Request(base + '/v8/inventory',
+                                             headers={'Authorization': 'Bearer ' + old_token})
+                with urllib.request.urlopen(req) as resp:
+                    items = json.loads(resp.read())['page']['content']
+                self.assertEqual(items[0]['uuid'], uuid)          # same uuid as before
+                self.assertEqual(items[0]['contentSources'], ['USER_UPLOAD'])
+                # a cover URL stored on the reader before the upgrade still works
+                with urllib.request.urlopen('%s/covers/%s/4102444800/%s' % (base, uuid, sig)) as r:
+                    self.assertEqual(r.status, 200)
+                form = urllib.parse.urlencode({'grant_type': 'refresh_token',
+                                               'refresh_token': 'old-refresh'}).encode()
+                with urllib.request.urlopen(base + '/oauth/token', data=form) as resp:
+                    self.assertEqual(resp.status, 200)
+            finally:
+                proc.terminate()
+                proc.wait()

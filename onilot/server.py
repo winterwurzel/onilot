@@ -8,8 +8,10 @@ Serves your own DRM-free EPUBs and syncs reading positions with the Tolino reade
 Configuration (environment variables; command-line flags override them):
   ONILOT_PUBLIC_URL   required  public base URL the reader was patched to, e.g.
                                 https://books.example.com/onilotapi  (TLS terminated in front)
-  ONILOT_PASSWORD     required  password for the reader's login page
-  ONILOT_LIBRARY      ./library directory with .epub files (uploads from the reader land here)
+  ONILOT_ADMIN_USER   admin     first admin account, created on first start together with
+  ONILOT_PASSWORD               its password (existing single-user data is moved to it)
+  ONILOT_LIBRARY      ./library books: LIBRARY/<user>/ is private (uploads from that user's reader
+                                land here), LIBRARY/shared/ is visible to every user
   ONILOT_DATA         ./data    state: reading positions, tokens, signing key
   ONILOT_PORT         8095
   ONILOT_BIND         127.0.0.1
@@ -18,9 +20,12 @@ Configuration (environment variables; command-line flags override them):
   ONILOT_REQUEST_LOG  0         1 = append every request/response to DATA/requests.jsonl
                                 (secrets redacted; useful for debugging new firmware)
 
-Single user, stdlib only (Python 3.10+). Runs plain HTTP; put TLS in front of it.
+Users: `python -m onilot user add NAME [--admin]` or the /admin page in a browser.
+Stdlib only (Python 3.10+). Runs plain HTTP; put TLS in front of it.
 """
 import argparse
+import shutil
+import sys
 import base64
 import datetime
 import email.parser
@@ -42,13 +47,16 @@ import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from onilot.users import UserError, UserStore, check_name, cli as user_cli
+
 RESELLER_ID = 1
-USER_ID = 'user1'
 CLIENT_ID = 'onilot'
 LOG_BODY_LIMIT = 64 * 1024
 SIGNED_URL_TTL = 24 * 3600
 COVER_NEVER_EXPIRES = 4102444800  # 2100-01-01; covers are low-sensitivity
 ACCESS_TOKEN_TTL = 3600
+ADMIN_SESSION_TTL = 8 * 3600
+CODE_TTL = 300
 COLLECTIONS = ('tags', 'comments', 'dogears')
 COUNTRY_NAMES = {'DE': 'Deutschland', 'AT': 'Österreich', 'CH': 'Schweiz'}
 
@@ -68,31 +76,51 @@ def redact(text):
     return BEARER.sub('<token>', SECRET_FIELDS.sub(r'\1<redacted>', text))
 
 
-def make_access_token():
+def make_access_token(user):
     # The device splits on '.', base64-decodes the middle part and reads "sub" as the
-    # bookshelf id. It does not check the signature.
+    # bookshelf id. It does not check the signature; onilot looks tokens up server-side.
     header = b64url(json.dumps({'alg': 'none', 'typ': 'JWT'}).encode())
-    payload = b64url(json.dumps({'sub': USER_ID, 'iat': int(time.time())}).encode())
+    payload = b64url(json.dumps({'sub': user, 'iat': int(time.time())}).encode())
     return '%s.%s.%s' % (header, payload, b64url(secrets.token_bytes(16)))
 
 
 class Library:
-    """EPUB files in a directory; the uuid is derived from the file name so it stays stable."""
+    """EPUB files in one or more directories.
+
+    roots: list of (directory, uuid prefix, shared flag). The uuid is sha1(prefix + file name),
+    so it stays stable; a user's own directory has prefix "" (compatible with single-user
+    installs), the shared directory "shared/".
+    """
 
     OPF_NS = {'opf': 'http://www.idpf.org/2007/opf', 'dc': 'http://purl.org/dc/elements/1.1/',
               'c': 'urn:oasis:names:tc:opendocument:xmlns:container'}
 
-    def __init__(self, root):
-        self.root = Path(root)
+    _meta_cache = {}
+    _meta_lock = threading.Lock()
+
+    def __init__(self, roots):
+        self.roots = [(Path(d), prefix, shared) for d, prefix, shared in roots]
 
     def books(self):
         result = []
-        for path in sorted(self.root.glob('*.epub')):
-            uuid = hashlib.sha1(path.name.encode()).hexdigest()
-            meta = self._metadata(path)
-            result.append({'uuid': uuid, 'path': path, 'size': path.stat().st_size,
-                           'mtime': int(path.stat().st_mtime * 1000), **meta})
+        for root, prefix, shared in self.roots:
+            for path in sorted(root.glob('*.epub')):
+                stat = path.stat()
+                uuid = hashlib.sha1((prefix + path.name).encode()).hexdigest()
+                result.append({'uuid': uuid, 'path': path, 'size': stat.st_size,
+                               'mtime': int(stat.st_mtime * 1000), 'shared': shared,
+                               **self._cached_metadata(path, stat)})
         return result
+
+    def _cached_metadata(self, path, stat):
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        with self._meta_lock:
+            meta = self._meta_cache.get(key)
+        if meta is None:
+            meta = self._metadata(path)
+            with self._meta_lock:
+                self._meta_cache[key] = meta
+        return meta
 
     def find(self, uuid):
         return next((b for b in self.books() if b['uuid'] == uuid), None)
@@ -150,9 +178,8 @@ class State:
       "add" on e.g. /publications/<uuid>/bookmark with a local "transientId" in the value.
     - The server must echo each add with the server id appended to the path
       (/publications/<uuid>/bookmark/<id>) and "transientId" + "revision" in the value; the
-      device then stores backendId/revision (TolinoDbHelper::addBackendIdAndRevision) and
-      sends later changes as "replace" on the path with the id. Without the echo it re-sends
-      the add on every sync.
+      device then records the server id and sends later changes as "replace" on the path
+      with the id. Without the echo it re-sends the add on every sync.
     - The response also carries every document changed after the client's revision, so
       positions written by other clients reach the device.
     - Conflicts: last write wins by "modified".
@@ -285,7 +312,7 @@ class State:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'tolino-selfhosted/0.1'
+    server_version = 'onilot/0.2'
     routes = []
 
     # ---- plumbing -----------------------------------------------------------------------
@@ -300,14 +327,17 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length') or 0)
         self.body = self.rfile.read(length) if length else b''
         self.response_log = None
-        if self.headers.get('Hardware-Id') and self._has_access_token():
-            self.server.seen_device(self.headers)
+        self.user = self._token_user()
+        if self.user and self.headers.get('Hardware-Id'):
+            self.ctx.seen_device(self.headers)
         for method, pattern, func, guard in self.routes:
             m = pattern.fullmatch(path)
             if m and method == self.command:
                 try:
-                    if guard == 'token' and not self._has_access_token():
+                    if guard == 'token' and not self.user:
                         self._send_json({'error': 'unauthorized'}, 401)
+                    elif guard == 'admin' and not self._admin_session():
+                        self._redirect('/admin')
                     elif guard == 'signed' and not self._has_valid_signature(*m.groups()):
                         self._send_json({'error': 'bad or expired signature'}, 403)
                     else:
@@ -371,21 +401,52 @@ class Handler(BaseHTTPRequestHandler):
         # URLs ("?size=WS-B04"), which would corrupt a query-string signature.
         # Covers never expire: the device stores frontCoverUrl permanently and re-fetches it
         # later. Book downloads expire (fresh downloadinfo is requested per download).
+        # The URL names the user and the signature covers it, so a link only opens that
+        # user's books.
         expires = COVER_NEVER_EXPIRES if kind == 'covers' else int(time.time()) + SIGNED_URL_TTL
-        sig = self.server.sign('%s:%s:%d' % (kind, uuid, expires))
-        return self._url('/%s/%s/%d/%s' % (kind, uuid, expires, sig))
+        sig = self.server.sign('%s:%s:%s:%d' % (kind, self.user, uuid, expires))
+        return self._url('/%s/%s/%s/%d/%s' % (kind, self.user, uuid, expires, sig))
 
-    def _has_valid_signature(self, kind, uuid, expires, sig):
-        expected = self.server.sign('%s:%s:%d' % (kind, uuid, int(expires)))
-        return int(expires) >= time.time() and hmac.compare_digest(expected, sig)
+    def _has_valid_signature(self, kind, *rest):
+        if len(rest) == 4:
+            user, uuid, expires, sig = rest
+            message = '%s:%s:%s:%d' % (kind, user, uuid, int(expires))
+        else:  # single-user era URL, still stored on readers (covers never expire)
+            uuid, expires, sig = rest
+            user = self.server.users.legacy_user()
+            message = '%s:%s:%d' % (kind, uuid, int(expires))
+        if not user or self.server.users.get(user) is None:
+            return False
+        self.user = user
+        return int(expires) >= time.time() and hmac.compare_digest(
+            self.server.sign(message), sig)
 
-    def _has_access_token(self):
-        # The exact auth header pairing is unverified ("%1 %2" in Authorization, or
-        # t_auth_token on v1 calls), so accept an issued token in any header value.
+    def _token_user(self):
+        # Readers send the token as "Authorization: Bearer" or "t_auth_token", so accept an
+        # issued token in any header value.
         jwt_like = re.compile(r'[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')
-        now = time.time()
-        return any(self.server.access_tokens.get(tok, 0) > now
-                   for value in self.headers.values() for tok in jwt_like.findall(value))
+        for value in self.headers.values():
+            for tok in jwt_like.findall(value):
+                user = self.server.access_user(tok)
+                if user:
+                    return user
+        return None
+
+    @property
+    def ctx(self):
+        return self.server.context(self.user)
+
+    def _redirect(self, path):
+        self._send(303, b'', 'text/plain', {'Location': self._url(path)})
+
+    def _admin_session(self):
+        cookie = self.headers.get('Cookie', '')
+        sid = next((c.split('=', 1)[1] for c in cookie.split('; ')
+                    if c.startswith('onilot_admin=')), None)
+        session = self.server.admin_session(sid)
+        if session:
+            self.admin, self.csrf = session
+        return bool(session)
 
     def log_message(self, fmt, *args):
         pass  # replaced by _log
@@ -393,9 +454,12 @@ class Handler(BaseHTTPRequestHandler):
     def _form(self):
         return {k: v[0] for k, v in urllib.parse.parse_qs(self.body.decode()).items()}
 
+    def _html(self, page, status=200, extra_headers=None):
+        self._send(status, page.encode(), 'text/html; charset=UTF-8', extra_headers)
+
 
 def route(method, regex, guard=None):
-    """guard: None (public), 'token' (issued access token), 'signed' (signed URL)."""
+    """guard: None (public), 'token' (access token), 'signed' (signed URL), 'admin'."""
     def wrap(func):
         Handler.routes.append((method, re.compile(regex), func, guard))
         return func
@@ -471,6 +535,7 @@ def reseller_config(h, reseller_id, client_type):
 LOGIN_PAGE = """<!doctype html><html><head><meta name=viewport content="width=device-width">
 <title>{brand} login</title></head><body style="font-family:sans-serif;font-size:1.4em">
 <h1>{brand}</h1><form method=post>
+<p>User<br><input name=username autocapitalize=none autocorrect=off style="font-size:1em"></p>
 <p>Password<br><input type=password name=password style="font-size:1em"></p>
 <p><button style="font-size:1em">Sign in</button></p></form>{message}</body></html>"""
 
@@ -482,13 +547,16 @@ def authorize_page(h):
 
 @route('POST', r'/oauth/authorize')
 def authorize_submit(h):
-    if h._form().get('password') != h.server.cfg.password:
+    form = h._form()
+    user = h.server.users.authenticate(form.get('username'), form.get('password'))
+    if user is None:
+        time.sleep(1)  # slow down guessing
         h._send(200, LOGIN_PAGE.format(brand=html.escape(h.server.cfg.brand),
-                                  message='<p>Wrong password.</p>').encode(),
+                                       message='<p>Wrong user or password.</p>').encode(),
                 'text/html; charset=UTF-8')
         return
     code = secrets.token_urlsafe(16)
-    h.server.codes.add(code)
+    h.server.codes[code] = (user, time.time() + CODE_TTL)
     h._send(302, b'', 'text/plain', {'Location': 'epublishing://login?code=' + code})
 
 
@@ -496,20 +564,17 @@ def authorize_submit(h):
 def token(h):
     form = h._form()
     grant = form.get('grant_type')
-    if grant == 'authorization_code' and form.get('code') not in h.server.codes:
+    if grant == 'authorization_code':
+        user, expires = h.server.codes.pop(form.get('code'), (None, 0))
+        user = user if expires > time.time() else None
+    elif grant == 'refresh_token':
+        user = h.server.take_refresh_token(form.get('refresh_token'))
+    else:
+        user = None
+    if not user or h.server.users.get(user) is None:
         h._send_json({'error': 'invalid_grant'}, 400)
         return
-    if grant == 'refresh_token' and form.get('refresh_token') not in h.server.refresh_tokens:
-        h._send_json({'error': 'invalid_grant'}, 400)
-        return
-    h.server.codes.discard(form.get('code'))
-    if grant == 'refresh_token':
-        h.server.refresh_tokens.discard(form.get('refresh_token'))
-    refresh = secrets.token_urlsafe(24)
-    access = make_access_token()
-    h.server.refresh_tokens.add(refresh)
-    h.server.access_tokens[access] = int(time.time()) + ACCESS_TOKEN_TTL
-    h.server.save_tokens()
+    access, refresh = h.server.issue_tokens(user)
     h._send_json({'access_token': access, 'refresh_token': refresh,
                   'expires_in': ACCESS_TOKEN_TTL, 'token_type': 'Bearer'})
 
@@ -521,13 +586,13 @@ def revoke(h):
 
 @route('POST', r'/v1/devices')
 def register_device(h):
-    h._send_json({'initAppResponse': {'userId': USER_ID, 'deviceKey': CLIENT_ID + '-device'}})
+    h._send_json({'initAppResponse': {'userId': h.user or '', 'deviceKey': CLIENT_ID + '-device'}})
 
 
 @route('GET', r'/v1/devices/([^/]+)/userid')
 def device_user_id(h, hardware_id):
     # Format not confirmed; the reader accepts this during setup.
-    h._send_json({'userId': USER_ID})
+    h._send_json({'userId': h.user or ''})
 
 
 # ---- library -------------------------------------------------------------------------------
@@ -542,8 +607,7 @@ def content_item(h, book):
         # never recognized the book as EPUB and never saved reading positions.
         'contentFormat': 'application/epub+zip',
         'contentType': 'EBOOK',
-        'contentSources': ['USER_UPLOAD' if book['path'].name in h.server.uploads
-                           else 'PURCHASED'],
+        'contentSources': ['USER_UPLOAD' if h.ctx.is_upload(book) else 'PURCHASED'],
         'contentIsPreview': False,
         'language': book['language'],
         'publisher': book['publisher'],
@@ -559,7 +623,7 @@ def content_item(h, book):
 
 @route('GET', r'/v8/inventory', 'token')
 def inventory(h):
-    books = h.server.library.books()
+    books = h.ctx.library.books()
     size = int(h.query.get('size', ['100'])[0])
     page = int(h.query.get('page', ['0'])[0])
     chunk = books[page * size:(page + 1) * size]
@@ -586,7 +650,7 @@ def inventory(h):
 
 @route('GET', r'/v1/inventory/([^/]+)/downloadinfo', 'token')
 def download_info(h, uuid):
-    book = h.server.library.find(uuid)
+    book = h.ctx.library.find(uuid)
     if book is None:
         h._send_json({'error': 'unknown book'}, 404)
         return
@@ -596,19 +660,23 @@ def download_info(h, uuid):
                   'fileSize': book['size']})
 
 
-@route('GET', r'/(content)/([0-9a-f]+)/(\d+)/([0-9a-f]{64})', 'signed')
-def content(h, kind, uuid, expires, sig):
-    book = h.server.library.find(uuid)
+@route('GET', r'/(content)/([a-z0-9._-]+)/([0-9a-f]{40})/(\d+)/([0-9a-f]{64})', 'signed')
+@route('GET', r'/(content)/([0-9a-f]{40})/(\d+)/([0-9a-f]{64})', 'signed')
+def content(h, kind, *rest):
+    uuid = rest[-3]
+    book = h.ctx.library.find(uuid)
     if book is None:
         h._send_json({'error': 'unknown book'}, 404)
         return
     h._send(200, book['path'].read_bytes(), 'application/epub+zip')
 
 
-@route('GET', r'/(covers)/([0-9a-f]+)/(\d+)/([0-9a-f]{64})', 'signed')
-def cover(h, kind, uuid, expires, sig):
-    book = h.server.library.find(uuid)
-    data, mime = h.server.library.cover_bytes(book) if book else (None, None)
+@route('GET', r'/(covers)/([a-z0-9._-]+)/([0-9a-f]{40})/(\d+)/([0-9a-f]{64})', 'signed')
+@route('GET', r'/(covers)/([0-9a-f]{40})/(\d+)/([0-9a-f]{64})', 'signed')
+def cover(h, kind, *rest):
+    uuid = rest[-3]
+    book = h.ctx.library.find(uuid)
+    data, mime = h.ctx.library.cover_bytes(book) if book else (None, None)
     if data is None:
         h._send_json({'error': 'no cover'}, 404)
         return
@@ -619,16 +687,18 @@ def cover(h, kind, uuid, expires, sig):
 
 SHOP_PAGE = """<!doctype html><html><head><meta name=viewport content="width=device-width">
 <title>{brand}</title></head><body style="font-family:sans-serif;font-size:1.3em">
-<h1>{brand}</h1><p>{count} books on the server. They appear in your library after a
-sync.</p><ul>{items}</ul></body></html>"""
+<h1>{brand}</h1><p>{count} shared books. Shared and your own books appear in your library
+after a sync; Settings &gt; account &gt; Link Library shows all of yours.</p><ul>{items}</ul>
+</body></html>"""
 
 
 # Some shop entry points concatenate SHOP_BASE + URL_SHOP_EBOOK_START_PAGE, producing
 # /shophttps://<host>/<prefix>/shop, so accept anything after /shop.
 @route('GET', r'/shop(?:https?://.*)?')
 def shop(h):
+    # The shop webview sends no token, so it can only show the shared library.
     query = h.query.get('q', [''])[0].lower()
-    books = [b for b in h.server.library.books()
+    books = [b for b in h.server.shared_library().books()
              if query in b['title'].lower() or any(query in a.lower() for a in b['authors'])]
     items = ''.join('<li>%s%s</li>' % (html.escape(b['title']),
                                         ' &ndash; ' + html.escape(', '.join(b['authors']))
@@ -675,9 +745,9 @@ def user_upload(h):
     if not data or not data.startswith(b'PK'):
         h._send_json({'error': 'expected an EPUB in multipart field "file"'}, 400)
         return
-    path = store_upload(h.server.cfg.library, filename, data)
-    h.server.mark_uploaded(path.name)
-    book = h.server.library.find(hashlib.sha1(path.name.encode()).hexdigest())
+    path = store_upload(h.ctx.library_dir, filename, data)
+    h.ctx.mark_uploaded(path.name)
+    book = h.ctx.library.find(hashlib.sha1(path.name.encode()).hexdigest())
     # Upload confirmation; "format" becomes the book's file type on the reader (MIME type).
     h._send_json({'metadata': {
         'inventoryUuid': book['uuid'],
@@ -703,9 +773,8 @@ def user_upload_cover(h, uuid):
 @route('GET', r'/v2/recommendations', 'token')
 def recommendations(h):
     count = int(h.query.get('count', ['12'])[0])
-    books = sorted(h.server.library.books(), key=lambda b: b['mtime'], reverse=True)[:count]
-    # Top-level array; keys from TolinoRecommendation(const QJsonObject&). Tapping one opens
-    # shop_url in the shop webview.
+    books = sorted(h.ctx.library.books(), key=lambda b: b['mtime'], reverse=True)[:count]
+    # Top-level array; tapping an entry opens shop_url in the shop webview.
     h._send_json([{
         'publicationId': b['uuid'],
         'title': b['title'],
@@ -754,10 +823,12 @@ LIBRARY_SCRIPT = """
 call('GET', '/onilot/library').then(function (d) {
   var items = d.books.map(function (b) {
     return '<li>' + esc(b.title) + (b.authors ? ' <span class="muted">' + esc(b.authors) +
-      '</span>' : '') + (b.uploaded ? ' <span class="muted">(uploaded)</span>' : '') + '</li>';
+      '</span>' : '') + (b.uploaded ? ' <span class="muted">(uploaded)</span>' : '') +
+      (b.shared ? ' <span class="muted">(shared)</span>' : '') + '</li>';
   }).join('');
-  document.getElementById('content').innerHTML = '<p>' + d.books.length +
-    ' books on this server. "Sync now" downloads new ones into your library.</p><ul>' +
+  document.getElementById('content').innerHTML = '<p>Signed in as <b>' + esc(d.user) +
+    '</b>. ' + d.books.length + ' books (yours and shared). "Sync now" brings new ones into ' +
+    'your library.</p><ul>' +
     items + '</ul>';
 }, fail);
 """
@@ -772,12 +843,12 @@ function load() {
         '<br><span class="muted">' + esc(x.id) + ' · last seen ' + fmt(x.last_seen) +
         '</span></li>';
     }).join('');
-    document.getElementById('content').innerHTML = '<p>Readers signed in to this server:</p>' +
+    document.getElementById('content').innerHTML = '<p>Your readers:</p>' +
       '<ul>' + items + '</ul>';
   }, fail);
 }
 function signOut() {
-  if (!confirm('Sign out every reader? Each has to sign in again with the password.')) return;
+  if (!confirm('Sign out all your readers? Each has to sign in again.')) return;
   call('POST', '/onilot/devices/sign-out').then(function () { leave('handshakeCancel'); }, fail);
 }
 load();
@@ -800,7 +871,7 @@ def manage_library(h):
 @route('GET', r'/manage/devices')
 def manage_devices(h):
     manage_page(h, 'Devices', DEVICES_SCRIPT,
-                '<button onclick="signOut()">Sign out all readers</button>')
+                '<button onclick="signOut()">Sign out my readers</button>')
 
 
 @route('GET', r'/manage/(handshakeFinish|handshakeCancel)')
@@ -811,22 +882,164 @@ def manage_leave(h, what):
 
 @route('GET', r'/onilot/library', 'token')
 def api_library(h):
-    h._send_json({'books': [{
+    h._send_json({'user': h.user, 'books': [{
         'uuid': b['uuid'], 'title': b['title'], 'authors': ', '.join(b['authors']),
-        'uploaded': b['path'].name in h.server.uploads,
-    } for b in sorted(h.server.library.books(), key=lambda b: b['title'].lower())]})
+        'uploaded': h.ctx.is_upload(b), 'shared': b['shared'],
+    } for b in sorted(h.ctx.library.books(), key=lambda b: b['title'].lower())]})
 
 
 @route('GET', r'/onilot/devices', 'token')
 def api_devices(h):
-    devices = [dict(v, id=k) for k, v in h.server.devices.items()]
+    devices = [dict(v, id=k) for k, v in h.ctx.devices.items()]
     h._send_json({'devices': sorted(devices, key=lambda d: -d.get('last_seen', 0))})
 
 
 @route('POST', r'/onilot/devices/sign-out', 'token')
 def api_sign_out(h):
-    h.server.sign_out_everyone()
+    h.server.sign_out(h.user)
     h._send_json({'signed_out': True})
+
+
+# ---- admin page (browser) ---------------------------------------------------------------------
+#
+# Session cookie (HttpOnly, SameSite=Strict, Secure on https) for admin users, plus a CSRF token
+# in every form.
+
+ADMIN_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name=viewport content="width=device-width"><title>{brand} admin</title>
+<style>
+body {{ font-family: sans-serif; max-width: 52em; margin: 2em auto; padding: 0 1em; }}
+table {{ border-collapse: collapse; width: 100%; }}
+td, th {{ text-align: left; padding: .4em; border-bottom: 1px solid #ddd; vertical-align: top; }}
+input, button {{ font-size: 1em; }} form.inline {{ display: inline; }}
+.msg {{ padding: .6em; background: #eef; }} .err {{ background: #fee; }}
+</style></head><body><h1>{brand} admin</h1>{body}</body></html>"""
+
+ADMIN_LOGIN = """{message}<form method=post action="{action}">
+<p><label>User<br><input name=username autocapitalize=none required></label></p>
+<p><label>Password<br><input type=password name=password required></label></p>
+<p><button>Sign in</button></p></form>"""
+
+
+def admin_html(h, body, status=200, extra_headers=None):
+    h._html(ADMIN_PAGE.format(brand=html.escape(h.server.cfg.brand), body=body), status,
+            extra_headers)
+
+
+def admin_message(h):
+    text = h.query.get('msg', [''])[0]
+    css = 'msg err' if h.query.get('err') else 'msg'
+    return '<p class="%s">%s</p>' % (css, html.escape(text)) if text else ''
+
+
+def admin_cookie(h, sid, max_age):
+    flags = 'Path=%s/admin; HttpOnly; SameSite=Strict; Max-Age=%d' % (h.server.cfg.prefix,
+                                                                        max_age)
+    if h.server.cfg.secure_cookies:
+        flags += '; Secure'
+    return {'Set-Cookie': 'onilot_admin=%s; %s' % (sid, flags)}
+
+
+@route('GET', r'/admin')
+def admin_index(h):
+    if not h._admin_session():
+        admin_html(h, ADMIN_LOGIN.format(message=admin_message(h),
+                                         action=html.escape(h._url('/admin/login'))))
+        return
+    csrf = html.escape(h.csrf)
+
+    def form(action, fields, label, confirm=None):
+        onsubmit = ' onsubmit="return confirm(%s)"' % html.escape(json.dumps(confirm)) \
+            if confirm else ''
+        return ('<form class=inline method=post action="%s"%s>'
+                '<input type=hidden name=csrf value="%s">%s<button>%s</button></form> ' % (
+                    html.escape(h._url('/admin/users')), onsubmit, csrf,
+                    ''.join('<input type=hidden name="%s" value="%s">' % (k, html.escape(v))
+                            for k, v in fields.items()) + action, label))
+
+    rows = []
+    for name in h.server.users.names():
+        is_admin = h.server.users.is_admin(name)
+        ctx = h.server.context(name)
+        books = sum(1 for b in ctx.library.books() if not b['shared'])
+        actions = form('<input type=password name=password placeholder="new password" '
+                       'minlength=8 required>', {'action': 'passwd', 'name': name},
+                       'Set password')
+        actions += form('', {'action': 'admin', 'name': name,
+                             'state': 'off' if is_admin else 'on'},
+                        'Revoke admin' if is_admin else 'Make admin')
+        if name != h.admin:
+            actions += form('', {'action': 'remove', 'name': name}, 'Delete',
+                            'Delete account %s? Books and reading data are kept.' % name)
+        rows.append('<tr><td><b>%s</b>%s</td><td>%d own books, %d readers</td><td>%s</td></tr>'
+                    % (html.escape(name), ' (admin)' if is_admin else '', books,
+                       len(ctx.devices), actions))
+    body = (admin_message(h)
+            + '<p>Signed in as <b>%s</b>. ' % html.escape(h.admin)
+            + form('', {'action': 'logout'}, 'Sign out') + '</p>'
+            + '<h2>Users</h2><table><tr><th>User</th><th>Data</th><th></th></tr>%s</table>'
+            % ''.join(rows)
+            + '<h2>Add user</h2>'
+            + form('<input name=name placeholder="name" pattern="[a-z0-9][a-z0-9._-]{0,31}" '
+                   'required> <input type=password name=password placeholder="password" '
+                   'minlength=8 required> <label><input type=checkbox name=admin value=1> '
+                   'admin</label> ', {'action': 'add'}, 'Add')
+            + '<p>Books: put files into <code>library/&lt;user&gt;/</code> (private) or '
+              '<code>library/shared/</code> (everyone).</p>')
+    admin_html(h, body)
+
+
+@route('POST', r'/admin/login')
+def admin_login(h):
+    form = h._form()
+    user = h.server.users.authenticate(form.get('username'), form.get('password'))
+    if user is None or not h.server.users.is_admin(user):
+        time.sleep(1)
+        admin_html(h, ADMIN_LOGIN.format(
+            message='<p class="msg err">Wrong user or password, or not an admin.</p>',
+            action=html.escape(h._url('/admin/login'))), 403)
+        return
+    sid = h.server.new_admin_session(user)
+    h._send(303, b'', 'text/plain', {'Location': h._url('/admin'),
+                                     **admin_cookie(h, sid, ADMIN_SESSION_TTL)})
+
+
+@route('POST', r'/admin/users', 'admin')
+def admin_users(h):
+    form = h._form()
+    if not hmac.compare_digest(form.get('csrf', ''), h.csrf):
+        admin_html(h, '<p class="msg err">Form expired, please reload.</p>', 403)
+        return
+    action, name = form.get('action'), (form.get('name') or '').strip().lower()
+    users = h.server.users
+    try:
+        if action == 'logout':
+            h.server.admin_sessions = {k: v for k, v in h.server.admin_sessions.items()
+                                       if v[0] != h.admin}
+            h._send(303, b'', 'text/plain', {'Location': h._url('/admin'),
+                                             **admin_cookie(h, '', 0)})
+            return
+        if action == 'add':
+            users.add(name, form.get('password', ''), admin=form.get('admin') == '1')
+            message = 'Created %s.' % name
+        elif action == 'passwd':
+            users.set_password(name, form.get('password', ''))
+            h.server.sign_out(name)
+            message = 'New password set for %s; their readers must sign in again.' % name
+        elif action == 'admin':
+            users.set_admin(name, form.get('state') == 'on')
+            message = 'Updated %s.' % name
+        elif action == 'remove':
+            if name == h.admin:
+                raise UserError('you cannot delete yourself')
+            users.remove(name)
+            h.server.sign_out(name)
+            message = 'Deleted %s (books and reading data kept).' % name
+        else:
+            raise UserError('unknown action')
+        h._redirect('/admin?msg=' + urllib.parse.quote(message))
+    except UserError as exc:
+        h._redirect('/admin?err=1&msg=' + urllib.parse.quote(str(exc)))
 
 
 # ---- reading progress -----------------------------------------------------------------------
@@ -834,47 +1047,34 @@ def api_sign_out(h):
 @route('PATCH', r'/v4/reading-metadata', 'token')
 def reading_metadata(h):
     request = json.loads(h.body or b'{}')
-    revision, patches = h.server.state.sync(request.get('revision'), request.get('patches', []))
+    revision, patches = h.ctx.state.sync(request.get('revision'), request.get('patches', []))
     h._send_json({'revision': revision, 'patches': patches, 'conflicts': []})
 
 
-class Server(ThreadingHTTPServer):
-    def __init__(self, cfg):
-        super().__init__((cfg.bind, cfg.port), Handler)
-        self.cfg = cfg
-        self.library = Library(cfg.library)
-        self.state = State(cfg.data)
-        self.log_lock = threading.Lock()
-        self.codes = set()
-        self.tokens_path = Path(cfg.data) / 'tokens.json'
-        saved = json.loads(self.tokens_path.read_text()) if self.tokens_path.exists() else {}
-        self.refresh_tokens = set(saved.get('refresh', []))
-        now = time.time()
-        self.access_tokens = {t: exp for t, exp in saved.get('access', {}).items() if exp > now}
-        self.devices_path = Path(cfg.data) / 'devices.json'
+class UserContext:
+    """Per-user state: reading metadata, devices, uploads and the library view."""
+
+    def __init__(self, server, name):
+        self.name = name
+        self.dir = Path(server.cfg.data) / 'users' / name
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.library_dir = Path(server.cfg.library) / name
+        self.library_dir.mkdir(parents=True, exist_ok=True)
+        self.library = Library([(self.library_dir, '', False),
+                                (server.shared_dir, 'shared/', True)])
+        self.state = State(self.dir)
+        self.lock = threading.Lock()
+        self.devices_path = self.dir / 'devices.json'
         self.devices = json.loads(self.devices_path.read_text()) \
             if self.devices_path.exists() else {}
-        self.devices_lock = threading.Lock()
-        self.uploads_path = Path(cfg.data) / 'uploads.json'
+        self.uploads_path = self.dir / 'uploads.json'
         self.uploads = set(json.loads(self.uploads_path.read_text())) \
             if self.uploads_path.exists() else set()
-        secret_path = Path(cfg.data) / 'url-signing.key'
-        if not secret_path.exists():
-            secret_path.write_bytes(secrets.token_bytes(32))
-            secret_path.chmod(0o600)
-        self.signing_key = secret_path.read_bytes()
-
-    def save_tokens(self):
-        now = time.time()
-        self.access_tokens = {t: e for t, e in self.access_tokens.items() if e > now}
-        self.tokens_path.write_text(json.dumps({'refresh': sorted(self.refresh_tokens),
-                                                'access': self.access_tokens}))
-        self.tokens_path.chmod(0o600)
 
     def seen_device(self, headers):
         hw = headers.get('Hardware-Id', '')[:64]
         now = int(time.time())
-        with self.devices_lock:
+        with self.lock:
             entry = self.devices.setdefault(hw, {'first_seen': now})
             previous = entry.get('last_seen', 0)
             entry['last_seen'] = now
@@ -884,17 +1084,129 @@ class Server(ThreadingHTTPServer):
             if now - previous > 60:  # do not rewrite the file on every request
                 self.devices_path.write_text(json.dumps(self.devices, indent=1))
 
-    def sign_out_everyone(self):
-        self.refresh_tokens.clear()
-        self.access_tokens.clear()
-        self.save_tokens()
+    def is_upload(self, book):
+        return not book['shared'] and book['path'].name in self.uploads
 
     def mark_uploaded(self, filename):
-        self.uploads.add(filename)
-        self.uploads_path.write_text(json.dumps(sorted(self.uploads)))
+        with self.lock:
+            self.uploads.add(filename)
+            self.uploads_path.write_text(json.dumps(sorted(self.uploads)))
+
+
+class Server(ThreadingHTTPServer):
+    def __init__(self, cfg, users):
+        super().__init__((cfg.bind, cfg.port), Handler)
+        self.cfg = cfg
+        self.users = users
+        self.shared_dir = Path(cfg.library) / 'shared'
+        self.shared_dir.mkdir(parents=True, exist_ok=True)
+        self.contexts = {}
+        self.contexts_lock = threading.Lock()
+        self.log_lock = threading.Lock()
+        self.tokens_lock = threading.Lock()
+        self.codes = {}            # code -> (user, expires)
+        self.admin_sessions = {}   # sid -> (user, expires, csrf)
+        self.tokens_path = Path(cfg.data) / 'tokens.json'
+        saved = json.loads(self.tokens_path.read_text()) if self.tokens_path.exists() else {}
+        now = time.time()
+        self.refresh_tokens = dict(saved.get('refresh', {}))                  # token -> user
+        self.access_tokens = {t: tuple(v) for t, v in saved.get('access', {}).items()
+                              if v[1] > now}                                  # token -> (user, exp)
+        secret_path = Path(cfg.data) / 'url-signing.key'
+        if not secret_path.exists():
+            secret_path.write_bytes(secrets.token_bytes(32))
+            secret_path.chmod(0o600)
+        self.signing_key = secret_path.read_bytes()
+
+    def context(self, user):
+        with self.contexts_lock:
+            if user not in self.contexts:
+                self.contexts[user] = UserContext(self, user)
+            return self.contexts[user]
+
+    def shared_library(self):
+        return Library([(self.shared_dir, 'shared/', True)])
+
+    # ---- tokens ------------------------------------------------------------------------------
+
+    def issue_tokens(self, user):
+        access, refresh = make_access_token(user), secrets.token_urlsafe(24)
+        with self.tokens_lock:
+            self.access_tokens[access] = (user, int(time.time()) + ACCESS_TOKEN_TTL)
+            self.refresh_tokens[refresh] = user
+            self._save_tokens()
+        return access, refresh
+
+    def access_user(self, token):
+        entry = self.access_tokens.get(token)
+        if not entry or entry[1] <= time.time() or self.users.get(entry[0]) is None:
+            return None
+        return entry[0]
+
+    def take_refresh_token(self, token):
+        with self.tokens_lock:
+            return self.refresh_tokens.pop(token, None)  # rotated: single use
+
+    def sign_out(self, user):
+        with self.tokens_lock:
+            self.refresh_tokens = {t: u for t, u in self.refresh_tokens.items() if u != user}
+            self.access_tokens = {t: v for t, v in self.access_tokens.items() if v[0] != user}
+            self._save_tokens()
+
+    def _save_tokens(self):
+        now = time.time()
+        self.access_tokens = {t: v for t, v in self.access_tokens.items() if v[1] > now}
+        self.tokens_path.write_text(json.dumps({'refresh': self.refresh_tokens,
+                                                'access': self.access_tokens}))
+        self.tokens_path.chmod(0o600)
+
+    # ---- admin sessions ----------------------------------------------------------------------
+
+    def new_admin_session(self, user):
+        sid, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(16)
+        self.admin_sessions[sid] = (user, time.time() + ADMIN_SESSION_TTL, csrf)
+        return sid
+
+    def admin_session(self, sid):
+        entry = self.admin_sessions.get(sid or '')
+        if not entry or entry[1] <= time.time() or not self.users.is_admin(entry[0]):
+            self.admin_sessions.pop(sid or '', None)
+            return None
+        return entry[0], entry[2]
 
     def sign(self, message):
         return hmac.new(self.signing_key, message.encode(), hashlib.sha256).hexdigest()
+
+
+def migrate_single_user(cfg, users, name, password):
+    """First start: create the admin and move single-user data (if any) to them."""
+    users.add(name, password, admin=True)
+    data, library = Path(cfg.data), Path(cfg.library)
+    user_dir = data / 'users' / name
+    user_dir.mkdir(parents=True, exist_ok=True)
+    moved = []
+    for filename in ('reading-metadata.json', 'devices.json', 'uploads.json'):
+        if (data / filename).exists():
+            shutil.move(str(data / filename), str(user_dir / filename))
+            moved.append(filename)
+    tokens_path = data / 'tokens.json'
+    if tokens_path.exists():
+        old = json.loads(tokens_path.read_text())
+        if isinstance(old.get('refresh'), list):  # single-user format
+            tokens_path.write_text(json.dumps({
+                'refresh': {t: name for t in old['refresh']},
+                'access': {t: [name, exp] for t, exp in old.get('access', {}).items()}}))
+            moved.append('tokens.json')
+    books = [p for p in library.glob('*.epub')]
+    if books:
+        (library / name).mkdir(parents=True, exist_ok=True)
+        for book in books:
+            shutil.move(str(book), str(library / name / book.name))
+        moved.append('%d books' % len(books))
+    if moved:
+        users.set_legacy_user(name)
+    print('onilot: created admin %r%s' % (
+        name, '; moved single-user data to it: ' + ', '.join(moved) if moved else ''), flush=True)
 
 
 def env_flag(name, default='0'):
@@ -907,7 +1219,7 @@ def main(argv=None):
     p.add_argument('--public-url', default=env('ONILOT_PUBLIC_URL'),
                    help='base URL the reader was patched to (ONILOT_PUBLIC_URL)')
     p.add_argument('--library', default=env('ONILOT_LIBRARY', 'library'),
-                   help='directory with .epub files (ONILOT_LIBRARY)')
+                   help='book directory (ONILOT_LIBRARY)')
     p.add_argument('--data', default=env('ONILOT_DATA', 'data'),
                    help='state directory (ONILOT_DATA)')
     p.add_argument('--port', type=int, default=int(env('ONILOT_PORT', '8095')))
@@ -918,25 +1230,48 @@ def main(argv=None):
     p.add_argument('--request-log', action='store_true', default=env_flag('ONILOT_REQUEST_LOG'),
                    help='log every request to DATA/requests.jsonl (ONILOT_REQUEST_LOG=1)')
     cfg = p.parse_args(argv)
-    cfg.password = env('ONILOT_PASSWORD')
     if not cfg.public_url:
         p.error('set ONILOT_PUBLIC_URL (or --public-url) to the URL the reader was patched to')
-    if not cfg.password:
-        p.error('set ONILOT_PASSWORD (password for the login page on the reader)')
     parts = urllib.parse.urlsplit(cfg.public_url)
     if parts.scheme not in ('http', 'https') or not parts.netloc or cfg.public_url.endswith('/'):
         p.error('ONILOT_PUBLIC_URL must look like https://host/path and must not end with "/"')
     cfg.public_base = cfg.public_url
     cfg.prefix = parts.path.rstrip('/')
+    cfg.secure_cookies = parts.scheme == 'https'
     Path(cfg.data).mkdir(parents=True, exist_ok=True)
     Path(cfg.library).mkdir(parents=True, exist_ok=True)
     cfg.log_file = str(Path(cfg.data) / 'requests.jsonl')
-    server = Server(cfg)
-    print('onilot: %d books, listening on %s:%d, API prefix %r, request log %s' % (
-        len(server.library.books()), cfg.bind, cfg.port, cfg.prefix,
+
+    users = UserStore(cfg.data)
+    if not users.exists():
+        password = env('ONILOT_PASSWORD')
+        name = env('ONILOT_ADMIN_USER', 'admin').strip().lower()
+        if not password:
+            p.error('no users yet: set ONILOT_ADMIN_USER and ONILOT_PASSWORD for the first admin, '
+                    'or run "python -m onilot user add NAME --admin"')
+        try:
+            check_name(name)
+            migrate_single_user(cfg, users, name, password)
+        except UserError as exc:
+            p.error(str(exc))
+    elif env('ONILOT_PASSWORD'):
+        print('onilot: users exist; ONILOT_PASSWORD is ignored (manage users with '
+              '"python -m onilot user" or /admin)', flush=True)
+
+    server = Server(cfg, users)
+    print('onilot: %d users, listening on %s:%d, API prefix %r, request log %s' % (
+        len(users.names()), cfg.bind, cfg.port, cfg.prefix,
         cfg.log_file if cfg.request_log else 'off'), flush=True)
     server.serve_forever()
 
 
+def entry(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['user']:
+        user_cli(argv[1:])
+    else:
+        main(argv)
+
+
 if __name__ == '__main__':
-    main()
+    entry()
