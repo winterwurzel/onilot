@@ -6,9 +6,10 @@ yourself instead of the vendor cloud.
 
 *onilot* is "tolino" backwards.
 
-> **Status: experimental.** Verified on a Tolino Vision Color with firmware
-> 5.18.264769. Other 5.x devices (Shine 5 / Shine Color) run the same software and will
-> probably work, but are untested.
+> **Status: no longer maintained (archived 2026-10-12).** The author moved to KOReader on
+> the device. The code worked on a Tolino Vision Color with firmware 5.18.264769 at that
+> point; other 5.x devices (Shine 5 / Shine Color) run the same software but were never
+> tested. Feel free to fork.
 
 ## What works
 
